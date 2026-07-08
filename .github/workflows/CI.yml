@@ -99,14 +99,14 @@ jobs:
           path: dist
 
   macos:
-    runs-on: ${{ matrix.platform.runner }}
+    # Both wheels build on the Apple-Silicon runner (x86_64 is cross-compiled),
+    # avoiding the deprecated / slow-to-schedule Intel macos-13 runners.
+    runs-on: macos-14
     strategy:
       matrix:
         platform:
-          - runner: macos-13
-            target: x86_64
-          - runner: macos-14
-            target: aarch64
+          - target: x86_64
+          - target: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
