@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # PyO3 0.23 supports up to CPython 3.13, but the runners now ship 3.14.
+  # We build a single stable-ABI (abi3) wheel per platform; this flag lets the
+  # build proceed when the build interpreter is newer than PyO3's known max.
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
 jobs:
   linux:
     runs-on: ${{ matrix.platform.runner }}
@@ -34,7 +40,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
           manylinux: auto
       - name: Upload wheels
@@ -59,7 +65,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
           manylinux: musllinux_1_2
       - name: Upload wheels
@@ -84,7 +90,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -110,7 +116,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist --find-interpreter
+          args: --release --out dist
           sccache: "true"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
