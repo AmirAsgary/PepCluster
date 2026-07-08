@@ -175,11 +175,12 @@ pytest
 
 Wheels are built for Linux / macOS / Windows by
 [`.github/workflows/CI.yml`](.github/workflows/CI.yml) and published to PyPI on
-version tags.
+version tags via [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+(OpenID Connect — no API token or stored secret).
 
-1. One-time: create a [PyPI API token](https://pypi.org/help/#apitoken) and add
-   it to the repo as a secret named `MATURIN_PYPI_TOKEN`
-   (**Settings → Secrets and variables → Actions**).
+1. One-time: on <https://pypi.org/manage/account/publishing/> add a pending
+   publisher — Owner `AmirAsgary`, Repository `PepCluster`, Workflow `CI.yml`
+   (leave the environment blank).
 2. Bump the version in `pyproject.toml` **and** `Cargo.toml`.
 3. Tag and push:
 
