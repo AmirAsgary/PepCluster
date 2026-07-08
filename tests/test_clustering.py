@@ -9,8 +9,11 @@ import pepcluster
 from pepcluster.clustering import (
     parse_fasta,
     extract_anchor,
+    anchor_sim_fast,
     cluster_anchors_py,
     refine_clusters_py,
+    cluster_representatives,
+    _to_ords,
 )
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "peptides.fasta"
@@ -70,3 +73,68 @@ def test_cluster_fasta_writes_outputs(tmp_path):
     assert stats["too_short"] == 1
     assert stats["valid_peptides"] == 18
     assert stats["n_clusters"] >= 1
+
+
+# ── Cluster representatives ────────────────────────────────────────────────
+
+def _brute_force_medoid(counts, mapping):
+    """Reference O(k^2) peptide-level medoid per cluster: for each member the
+    total frequency-weighted similarity to the whole cluster, argmax = medoid.
+    Returns {centroid: max_sigma} so we can compare optimal scores directly."""
+    groups = defaultdict(list)
+    for a, c in mapping.items():
+        groups[c].append(a)
+    best_sigma = {}
+    for centroid, anchors in groups.items():
+        ords = {a: _to_ords(a) for a in anchors}
+        best = None
+        for a in anchors:
+            sigma = sum(counts[b] * anchor_sim_fast(ords[a], ords[b], -1.0)
+                        for b in anchors)
+            best = sigma if best is None else max(best, sigma)
+        best_sigma[centroid] = best
+    return best_sigma
+
+
+def test_cluster_representatives_are_optimal():
+    counts = _anchor_counts()
+    mapping, _, _ = cluster_anchors_py(counts, THRESHOLD)
+    reps = cluster_representatives(counts, mapping)
+    best_sigma = _brute_force_medoid(counts, mapping)
+
+    # Every cluster has a representative that is one of its own members.
+    members = defaultdict(set)
+    for a, c in mapping.items():
+        members[c].add(a)
+    for centroid, rep in reps.items():
+        assert rep in members[centroid]
+
+    # The fast decomposition must pick a genuine medoid: the representative's
+    # total similarity equals the brute-force maximum.
+    ords = {a: _to_ords(a) for a in counts}
+    for centroid, rep in reps.items():
+        sigma_rep = sum(counts[b] * anchor_sim_fast(ords[rep], ords[b], -1.0)
+                        for b in members[centroid])
+        assert sigma_rep == pytest.approx(best_sigma[centroid], rel=1e-5)
+
+
+def test_output_has_representative_peptide_column(tmp_path):
+    pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path),
+                             threshold=THRESHOLD, verbose=False)
+    header = (tmp_path / "clusters.tsv").read_text().splitlines()[0].split("\t")
+    assert "representative_peptide" in header
+    summ = (tmp_path / "cluster_summary.tsv").read_text().splitlines()
+    assert "representative_peptide" in summ[0].split("\t")
+
+    # Every representative_peptide must be a real member sequence of its cluster.
+    rep_col = header.index("representative_peptide")
+    seq_col = header.index("sequence")
+    cid_col = header.index("cluster_id")
+    seqs_by_cluster = defaultdict(set)
+    reps_by_cluster = {}
+    for line in (tmp_path / "clusters.tsv").read_text().splitlines()[1:]:
+        f = line.split("\t")
+        seqs_by_cluster[f[cid_col]].add(f[seq_col])
+        reps_by_cluster[f[cid_col]] = f[rep_col]
+    for cid, rep in reps_by_cluster.items():
+        assert rep in seqs_by_cluster[cid]

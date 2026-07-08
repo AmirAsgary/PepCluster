@@ -20,6 +20,7 @@ Typical usage::
 
 from .clustering import (
     cluster_fasta,
+    cluster_representatives,
     cluster_anchors_py,
     refine_clusters_py,
     extract_anchor,
@@ -27,7 +28,7 @@ from .clustering import (
     anchor_sim_fast,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Prefer the compiled Rust backend; fall back to the pure-Python reference.
 try:
@@ -44,6 +45,7 @@ __all__ = [
     "__version__",
     "HAS_RUST",
     "cluster_fasta",
+    "cluster_representatives",
     "cluster_anchors",
     "refine_clusters",
     "cluster_anchors_py",

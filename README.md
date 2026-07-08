@@ -94,14 +94,20 @@ fall back to identical pure-Python implementations otherwise).
 
 ```
 out/
-├── clusters.tsv            # cluster_id, representative_anchor, header, sequence, anchor (every peptide)
-├── cluster_summary.tsv     # cluster_id, representative_anchor, size (sorted by size)
+├── clusters.tsv            # cluster_id, representative_anchor, representative_peptide, header, sequence, anchor (every peptide)
+├── cluster_summary.tsv     # cluster_id, representative_anchor, representative_peptide, size (sorted by size)
 ├── summary.txt             # run statistics
 └── fasta/
     ├── cluster_0.fasta     # per-cluster FASTA, ready for MSA (>= --min-cluster-size members)
     ├── cluster_1.fasta
     └── SHORT_peptides.fasta # peptides too short to form an anchor (if any)
 ```
+
+**`representative_peptide`** is the cluster's *central* member — the peptide
+with the least average distance (highest weighted average similarity) to every
+other peptide in the cluster. It is computed in linear time and is always a
+real member sequence, so it's a good label or seed for each cluster.
+`representative_anchor` is the anchor that originally seeded the cluster.
 
 ---
 

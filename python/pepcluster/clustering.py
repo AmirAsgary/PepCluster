@@ -424,6 +424,92 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
 
 
 # ============================================================================
+# Cluster representatives (medoid anchors)
+# ============================================================================
+
+def cluster_representatives(anchor_counts, mapping):
+    """
+    Find the representative (medoid) anchor of every cluster.
+
+    The representative is the member anchor with the **least average distance**
+    to all peptides in its cluster — equivalently, the highest frequency-
+    weighted average similarity. Any peptide carrying this anchor is a valid
+    "central" representative of the cluster.
+
+    Fast by construction: the similarity is an additive sum over the 6 anchor
+    positions, so instead of the naive O(k^2) all-pairs medoid we aggregate,
+    per position, a peptide-weighted amino-acid frequency over the cluster and
+    score each member in O(1) per position. Total cost is O(total_anchors)
+    plus a tiny per-cluster constant — no pairwise loop.
+
+    For a peptide with anchor ``a``, its total similarity to the whole cluster
+    is ``Sigma(a) = sum_p sum_j count_j * wsim_p(a_p, a_j_p)``. Every peptide
+    sharing anchor ``a`` has the same average distance, so the medoid is simply
+    ``argmax_a Sigma(a)`` over the cluster's member anchors.
+
+    Args:
+        anchor_counts: dict[str, int] — unique anchor → peptide frequency
+        mapping:       dict[str, str] — anchor → centroid (clustering output)
+
+    Returns:
+        dict[str, str] — centroid anchor → medoid (representative) anchor
+    """
+    groups = defaultdict(list)
+    for a, c in mapping.items():
+        groups[c].append(a)
+
+    reps = {}
+    for centroid, anchors in groups.items():
+        if len(anchors) == 1:
+            reps[centroid] = anchors[0]
+            continue
+
+        # Peptide-weighted amino-acid frequency at each of the 6 positions,
+        # stored as (ord(aa), weight) lists for fast inner loops.
+        freq = [defaultdict(float) for _ in range(6)]
+        for a in anchors:
+            cnt = anchor_counts[a]
+            f0, f1, f2, f3, f4, f5 = freq
+            f0[a[0]] += cnt
+            f1[a[1]] += cnt
+            f2[a[2]] += cnt
+            f3[a[3]] += cnt
+            f4[a[4]] += cnt
+            f5[a[5]] += cnt
+
+        # Per-position, weighted similarity score for each residue present:
+        #   sp[p][x] = sum_aa freq_p[aa] * WSIM[p][ord(x)*128 + ord(aa)]
+        sp = []
+        for p in range(6):
+            wp = WSIM[p]
+            present = [(ord(aa), w) for aa, w in freq[p].items()]
+            tbl = {}
+            for res in freq[p]:
+                base = ord(res) * 128
+                s = 0.0
+                for oaa, w in present:
+                    s += w * wp[base + oaa]
+                tbl[res] = s
+            sp.append(tbl)
+
+        sp0, sp1, sp2, sp3, sp4, sp5 = sp
+        # Deterministic argmax: highest Sigma, then highest count, then the
+        # lexicographically smallest anchor (via sorted iteration + strict >).
+        best_anchor = None
+        best_key = None
+        for a in sorted(anchors):
+            sigma = (sp0[a[0]] + sp1[a[1]] + sp2[a[2]]
+                     + sp3[a[3]] + sp4[a[4]] + sp5[a[5]])
+            key = (sigma, anchor_counts[a])
+            if best_key is None or key > best_key:
+                best_key = key
+                best_anchor = a
+        reps[centroid] = best_anchor
+
+    return reps
+
+
+# ============================================================================
 # Backend resolution
 # ============================================================================
 
@@ -494,6 +580,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
     peptides = []
     short = []
     acounts = defaultdict(int)
+    anchor_to_pep = {}  # anchor -> first (header, sequence) seen, for representatives
 
     for hdr, seq in parse_fasta(input):
         seq = seq.upper()
@@ -503,6 +590,8 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         else:
             peptides.append((hdr, seq, anc))
             acounts[anc] += 1
+            if anc not in anchor_to_pep:
+                anchor_to_pep[anc] = (hdr, seq)
 
     n_total = len(peptides) + len(short)
     n_unique = len(acounts)
@@ -536,31 +625,38 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
             f"→ {refine_stats['final_clusters']:,}")
         n_clusters = refine_stats["final_clusters"]
 
-    # ── Step 3: assign peptides → clusters ────────────────────────────
-    log("\n[3/4] Assigning peptides to clusters …", flush=True)
+    # ── Step 3: assign peptides → clusters + pick representatives ──────
+    log("\n[3/4] Assigning peptides and finding representatives …", flush=True)
     clusters = defaultdict(list)
     for hdr, seq, anc in peptides:
         clusters[mapping[anc]].append((hdr, seq, anc))
 
     ranked = sorted(clusters.items(), key=lambda kv: (-len(kv[1]), kv[0]))
 
+    # Central (medoid) peptide per cluster: the member with the least average
+    # distance to the whole cluster. O(N), see cluster_representatives().
+    medoid_anchor = cluster_representatives(dict(acounts), mapping)
+    rep_seq_of = {ctr: anchor_to_pep[medoid_anchor[ctr]][1] for ctr, _ in ranked}
+
     # ── Step 4: write outputs ─────────────────────────────────────────
     log("[4/4] Writing outputs …", flush=True)
 
     # 4a. cluster_summary.tsv
     with open(outdir / "cluster_summary.tsv", "w") as f:
-        f.write("cluster_id\trepresentative_anchor\tsize\n")
+        f.write("cluster_id\trepresentative_anchor\trepresentative_peptide"
+                "\tsize\n")
         for idx, (ctr, members) in enumerate(ranked):
-            f.write(f"cluster_{idx}\t{ctr}\t{len(members)}\n")
+            f.write(f"cluster_{idx}\t{ctr}\t{rep_seq_of[ctr]}\t{len(members)}\n")
 
     # 4b. clusters.tsv (full mapping)
     with open(outdir / "clusters.tsv", "w") as f:
-        f.write("cluster_id\trepresentative_anchor\tpeptide_header"
-                "\tsequence\tanchor\n")
+        f.write("cluster_id\trepresentative_anchor\trepresentative_peptide"
+                "\tpeptide_header\tsequence\tanchor\n")
         for idx, (ctr, members) in enumerate(ranked):
             cname = f"cluster_{idx}"
+            rep_seq = rep_seq_of[ctr]
             for hdr, seq, anc in members:
-                f.write(f"{cname}\t{ctr}\t{hdr}\t{seq}\t{anc}\n")
+                f.write(f"{cname}\t{ctr}\t{rep_seq}\t{hdr}\t{seq}\t{anc}\n")
 
     # 4c. per-cluster FASTA
     n_fasta = 0
