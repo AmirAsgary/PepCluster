@@ -32,6 +32,13 @@ def main(argv=None):
     ap.add_argument("--iterations", type=int, default=3,
                     help="Max refinement passes (default: 3; only used "
                          "with --refinement)")
+    ap.add_argument("--refine-cap", type=int, default=32,
+                    help="Max centroid comparisons per anchor during "
+                         "refinement reassignment (default: 32; <=0 = no cap). "
+                         "Lower is faster; only used with --refinement")
+    ap.add_argument("--no-merge", action="store_true",
+                    help="Skip the centroid-merge step during refinement "
+                         "(faster; only used with --refinement)")
     ap.add_argument("--backend", choices=["auto", "rust", "python"],
                     default="auto",
                     help="Clustering backend (default: auto — Rust if built, "
@@ -51,6 +58,8 @@ def main(argv=None):
         n_back=args.n_back,
         refinement=args.refinement,
         iterations=args.iterations,
+        refine_cap=args.refine_cap,
+        merge=not args.no_merge,
         backend=args.backend,
         verbose=not args.quiet,
     )

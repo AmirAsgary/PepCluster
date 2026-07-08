@@ -52,16 +52,17 @@ const COARSE_GROUPS: &[&[u8]] = &[
 // Position weights: P1=1, P2=2, P3=1, PΩ-2=1, PΩ-1=1, PΩ=2  (sum=8)
 // Check order: [1, 5, 0, 2, 3, 4] — high-weight positions first for early exit
 const CHECK_ORDER: [usize; 6] = [1, 5, 0, 2, 3, 4];
-const RAW_WEIGHTS: [f32; 6] = [1.0, 2.0, 1.0, 1.0, 1.0, 2.0];
-const WEIGHT_SUM: f32 = 8.0;
+const RAW_WEIGHTS: [f64; 6] = [1.0, 2.0, 1.0, 1.0, 1.0, 2.0];
+const WEIGHT_SUM: f64 = 8.0;
 
 /// Precomputed similarity tables and blocking tables
 struct SimTables {
     /// wsim[pos][a * 128 + b] = normalized BLOSUM62 * weight for position `pos`
     /// Positions stored in CHECK_ORDER: [1, 5, 0, 2, 3, 4]
-    wsim: [[f32; 128 * 128]; 6],
+    /// f64 (not f32) so the arithmetic is bit-identical to the Python backend.
+    wsim: [[f64; 128 * 128]; 6],
     /// remaining_after[i] = max possible score from positions CHECK_ORDER[i+1..]
-    remaining_after: [f32; 7],
+    remaining_after: [f64; 7],
     /// coarse group id for each ASCII byte (0..9), 255 = unknown
     coarse: [u8; 128],
 }
@@ -75,24 +76,24 @@ impl SimTables {
         }
 
         // Self-scores for normalization
-        let mut self_score = [0.0f32; 20];
+        let mut self_score = [0.0f64; 20];
         for i in 0..20 {
-            self_score[i] = BLOSUM62[i * 20 + i] as f32;
+            self_score[i] = BLOSUM62[i * 20 + i] as f64;
         }
 
         // Normalized similarity: sim(a,b) = B(a,b) / sqrt(B(a,a) * B(b,b))
-        let mut norm_sim = [[0.0f32; 20]; 20];
+        let mut norm_sim = [[0.0f64; 20]; 20];
         for i in 0..20 {
             for j in 0..20 {
                 let denom = (self_score[i] * self_score[j]).sqrt();
                 if denom > 0.0 {
-                    norm_sim[i][j] = BLOSUM62[i * 20 + j] as f32 / denom;
+                    norm_sim[i][j] = BLOSUM62[i * 20 + j] as f64 / denom;
                 }
             }
         }
 
         // Build weighted similarity tables in CHECK_ORDER
-        let mut wsim = [[0.0f32; 128 * 128]; 6];
+        let mut wsim = [[0.0f64; 128 * 128]; 6];
         for (check_idx, &pos) in CHECK_ORDER.iter().enumerate() {
             let w = RAW_WEIGHTS[pos] / WEIGHT_SUM;
             for &a in AA_ORDER.iter() {
@@ -106,7 +107,7 @@ impl SimTables {
         }
 
         // remaining_after[i] = sum of weights for CHECK_ORDER positions i+1..6
-        let mut remaining_after = [0.0f32; 7];
+        let mut remaining_after = [0.0f64; 7];
         for i in (0..6).rev() {
             let pos = CHECK_ORDER[i];
             remaining_after[i] = remaining_after[i + 1] + RAW_WEIGHTS[pos] / WEIGHT_SUM;
@@ -126,8 +127,8 @@ impl SimTables {
     /// Compute weighted BLOSUM62-normalized similarity with early termination.
     /// Returns the score if >= threshold, otherwise returns -1.0.
     #[inline]
-    fn anchor_sim(&self, a: &[u8; 6], b: &[u8; 6], threshold: f32) -> f32 {
-        let mut s: f32 = 0.0;
+    fn anchor_sim(&self, a: &[u8; 6], b: &[u8; 6], threshold: f64) -> f64 {
+        let mut s: f64 = 0.0;
 
         // Check position 1 (P2, weight 2×)
         s += self.wsim[0][(a[1] as usize) * 128 + (b[1] as usize)];
@@ -153,8 +154,8 @@ impl SimTables {
     /// Used by the refinement pass where we need the actual score (e.g.
     /// for medoid scoring and for comparing against the current centroid).
     #[inline]
-    fn anchor_sim_full(&self, a: &[u8; 6], b: &[u8; 6]) -> f32 {
-        let mut s: f32 = 0.0;
+    fn anchor_sim_full(&self, a: &[u8; 6], b: &[u8; 6]) -> f64 {
+        let mut s: f64 = 0.0;
         s += self.wsim[0][(a[1] as usize) * 128 + (b[1] as usize)];
         s += self.wsim[1][(a[5] as usize) * 128 + (b[5] as usize)];
         s += self.wsim[2][(a[0] as usize) * 128 + (b[0] as usize)];
@@ -193,7 +194,6 @@ fn cluster_anchors(
     anchor_counts: &Bound<'_, PyDict>,
     threshold: f64,
 ) -> PyResult<(PyObject, u64, u64)> {
-    let threshold = threshold as f32;
     let tables = SimTables::new();
 
     // Collect and parse anchors, sort by frequency descending
@@ -290,20 +290,27 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     mapping:       dict[str, str]  — unique anchor → centroid
 ///     threshold:     float           — same as initial clustering
 ///     iterations:    int             — max passes
+///     cap:           int             — max centroid comparisons per anchor in
+///                                      the reassignment step (candidate cap).
+///                                      Candidates are examined own-block-first,
+///                                      largest-cluster-first. <= 0 means no cap.
+///     merge:         bool            — run the centroid-merge sub-step
 ///
 /// Returns:
 ///     (refined_mapping, stats_dict)
 ///     stats_dict keys: passes, medoid_changes, reassignments, merges,
 ///                       initial_clusters, final_clusters
 #[pyfunction]
+#[pyo3(signature = (anchor_counts, mapping, threshold, iterations, cap=32, merge=true))]
 fn refine_clusters(
     py: Python<'_>,
     anchor_counts: &Bound<'_, PyDict>,
     mapping: &Bound<'_, PyDict>,
     threshold: f64,
     iterations: usize,
+    cap: i64,
+    merge: bool,
 ) -> PyResult<(PyObject, PyObject)> {
-    let threshold = threshold as f32;
     let tables = SimTables::new();
 
     // ── Parse anchor_counts into parallel vectors ─────────────────────
@@ -355,6 +362,12 @@ fn refine_clusters(
         for i in 0..n {
             members.entry(cur_centroid[i]).or_default().push(i);
         }
+        // Canonical member order (anchor ascending) so the medoid argmax and
+        // its ties resolve deterministically — identical across runs and the
+        // Python backend, independent of hash iteration order.
+        for v in members.values_mut() {
+            v.sort_by(|&a, &b| names[a].cmp(&names[b]));
+        }
 
         let mut centroid_remap: HashMap<usize, usize> = HashMap::with_capacity(members.len());
         for (&centroid, mems) in members.iter() {
@@ -363,14 +376,14 @@ fn refine_clusters(
                 continue;
             }
             let mut best_member = centroid;
-            let mut best_score: f32 = f32::NEG_INFINITY;
+            let mut best_score: f64 = f64::NEG_INFINITY;
             for &i in mems.iter() {
-                let mut s: f32 = 0.0;
-                let mut w: f32 = 0.0;
+                let mut s: f64 = 0.0;
+                let mut w: f64 = 0.0;
                 for &j in mems.iter() {
                     if i == j { continue; }
                     let sim = tables.anchor_sim_full(&anchors[i], &anchors[j]);
-                    let fj  = freqs[j] as f32;
+                    let fj  = freqs[j] as f64;
                     s += fj * sim;
                     w += fj;
                 }
@@ -390,9 +403,16 @@ fn refine_clusters(
             cur_centroid[i] = centroid_remap[&cur_centroid[i]];
         }
 
-        // ── 2. Cross-block reassignment ───────────────────────────────
+        // ── 2. Cross-block reassignment (candidate-capped) ────────────
         let current_centroids: HashSet<usize> =
             cur_centroid.iter().copied().collect();
+
+        // Cluster frequency drives the "most promising first" candidate order.
+        let mut cluster_freq2: HashMap<usize, u64> = HashMap::new();
+        for i in 0..n {
+            *cluster_freq2.entry(cur_centroid[i]).or_insert(0) += freqs[i];
+        }
+
         let mut centroids_in_block: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
         for &c in current_centroids.iter() {
             centroids_in_block
@@ -400,16 +420,28 @@ fn refine_clusters(
                 .or_default()
                 .push(c);
         }
+        // Within each block, examine larger clusters first (then anchor asc for
+        // a deterministic order that matches the Python backend exactly).
+        for v in centroids_in_block.values_mut() {
+            v.sort_by(|&a, &b| {
+                cluster_freq2[&b].cmp(&cluster_freq2[&a])
+                    .then_with(|| names[a].cmp(&names[b]))
+            });
+        }
 
-        // Precompute neighbour-block lists
-        let all_blocks: Vec<(u8, u8)> = centroids_in_block.keys().copied().collect();
+        // Neighbour blocks, own block first, then the rest in sorted order.
+        let mut sorted_blocks: Vec<(u8, u8)> =
+            centroids_in_block.keys().copied().collect();
+        sorted_blocks.sort();
         let mut neighbours_of: HashMap<(u8, u8), Vec<(u8, u8)>> = HashMap::new();
-        for &bk in all_blocks.iter() {
+        for &bk in centroids_in_block.keys() {
             let (p, q) = bk;
-            let nb: Vec<(u8, u8)> = all_blocks.iter()
-                .filter(|b| b.0 == p || b.1 == q)
-                .copied()
-                .collect();
+            let mut nb: Vec<(u8, u8)> = vec![bk];
+            for &b in sorted_blocks.iter() {
+                if b != bk && (b.0 == p || b.1 == q) {
+                    nb.push(b);
+                }
+            }
             neighbours_of.insert(bk, nb);
         }
 
@@ -424,12 +456,15 @@ fn refine_clusters(
             let mut best_score = cur_score;
 
             let nbs = neighbours_of.get(&bk).unwrap_or(&fallback_nb);
-            for &nb in nbs.iter() {
+            let mut examined: i64 = 0;
+            'scan: for &nb in nbs.iter() {
                 if let Some(centroids) = centroids_in_block.get(&nb) {
                     for &c in centroids.iter() {
                         if c == cur_c { continue; }
+                        if cap > 0 && examined >= cap { break 'scan; }
                         let sc = tables.anchor_sim(
                             &anchors[i], &anchors[c], threshold);
+                        examined += 1;
                         if sc < 0.0 { continue; }
                         if sc > best_score {
                             best_score = sc;
@@ -446,64 +481,66 @@ fn refine_clusters(
         }
         total_reassignments += pass_reassigns;
 
-        // ── 3. Centroid merge ─────────────────────────────────────────
-        let mut cluster_freq: HashMap<usize, u64> = HashMap::new();
-        for i in 0..n {
-            *cluster_freq.entry(cur_centroid[i]).or_insert(0) += freqs[i];
-        }
-        let mut sorted_cents: Vec<usize> =
-            cluster_freq.keys().copied().collect();
-        sorted_cents.sort_by(|&a, &b| {
-            cluster_freq[&b].cmp(&cluster_freq[&a])
-                .then(a.cmp(&b))  // deterministic tiebreak
-        });
+        // ── 3. Centroid merge (optional; skipped when merge=false) ────
+        if merge {
+            let mut cluster_freq: HashMap<usize, u64> = HashMap::new();
+            for i in 0..n {
+                *cluster_freq.entry(cur_centroid[i]).or_insert(0) += freqs[i];
+            }
+            let mut sorted_cents: Vec<usize> =
+                cluster_freq.keys().copied().collect();
+            sorted_cents.sort_by(|&a, &b| {
+                cluster_freq[&b].cmp(&cluster_freq[&a])
+                    .then_with(|| names[a].cmp(&names[b]))  // anchor asc (matches Python)
+            });
 
-        let mut centroids_in_block: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
-        let mut block_of: HashMap<usize, (u8, u8)> = HashMap::new();
-        for &c in sorted_cents.iter() {
-            let bk = tables.block_key(&anchors[c]);
-            centroids_in_block.entry(bk).or_default().push(c);
-            block_of.insert(c, bk);
-        }
+            let mut centroids_in_block: HashMap<(u8, u8), Vec<usize>> = HashMap::new();
+            let mut block_of: HashMap<usize, (u8, u8)> = HashMap::new();
+            for &c in sorted_cents.iter() {
+                let bk = tables.block_key(&anchors[c]);
+                centroids_in_block.entry(bk).or_default().push(c);
+                block_of.insert(c, bk);
+            }
 
-        let mut merge_map: HashMap<usize, usize> = HashMap::new();
-        let mut absorbed:  HashSet<usize>       = HashSet::new();
+            let mut merge_map: HashMap<usize, usize> = HashMap::new();
+            let mut absorbed:  HashSet<usize>       = HashSet::new();
 
-        for &c1 in sorted_cents.iter() {
-            if absorbed.contains(&c1) { continue; }
-            let (p1, q1) = block_of[&c1];
-            let nb_keys: Vec<(u8, u8)> = centroids_in_block.keys()
-                .filter(|b| b.0 == p1 || b.1 == q1)
-                .copied()
-                .collect();
-            for bk2 in &nb_keys {
-                if let Some(centroids2) = centroids_in_block.get(bk2) {
-                    for &c2 in centroids2 {
-                        if c2 == c1 || absorbed.contains(&c2) { continue; }
-                        if cluster_freq[&c2] >= cluster_freq[&c1] {
-                            continue;  // only smaller absorbed into larger
-                        }
-                        let sc = tables.anchor_sim(
-                            &anchors[c1], &anchors[c2], threshold);
-                        if sc >= threshold {
-                            merge_map.insert(c2, c1);
-                            absorbed.insert(c2);
-                            total_merges += 1;
-                            changed = true;
+            for &c1 in sorted_cents.iter() {
+                if absorbed.contains(&c1) { continue; }
+                let (p1, q1) = block_of[&c1];
+                let nb_keys: Vec<(u8, u8)> = centroids_in_block.keys()
+                    .filter(|b| b.0 == p1 || b.1 == q1)
+                    .copied()
+                    .collect();
+                for bk2 in &nb_keys {
+                    if let Some(centroids2) = centroids_in_block.get(bk2) {
+                        for &c2 in centroids2 {
+                            if c2 == c1 || absorbed.contains(&c2) { continue; }
+                            if cluster_freq[&c2] >= cluster_freq[&c1] {
+                                continue;  // only smaller absorbed into larger
+                            }
+                            let sc = tables.anchor_sim(
+                                &anchors[c1], &anchors[c2], threshold);
+                            if sc >= threshold {
+                                merge_map.insert(c2, c1);
+                                absorbed.insert(c2);
+                                total_merges += 1;
+                                changed = true;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if !merge_map.is_empty() {
-            // Transitive resolution: follow merge chains to the final target
-            for i in 0..n {
-                let mut c = cur_centroid[i];
-                while let Some(&next) = merge_map.get(&c) {
-                    c = next;
+            if !merge_map.is_empty() {
+                // Transitive resolution: follow merge chains to the final target
+                for i in 0..n {
+                    let mut c = cur_centroid[i];
+                    while let Some(&next) = merge_map.get(&c) {
+                        c = next;
+                    }
+                    cur_centroid[i] = c;
                 }
-                cur_centroid[i] = c;
             }
         }
 

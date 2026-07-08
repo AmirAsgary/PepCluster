@@ -244,7 +244,7 @@ def cluster_anchors_py(anchor_counts, threshold):
 # ============================================================================
 
 def refine_clusters_py(anchor_counts, mapping, threshold,
-                       iterations=3, verbose=False):
+                       iterations=3, cap=32, merge=True, verbose=False):
     """
     Lloyd-style refinement on top of greedy clustering output (pure-Python
     reference; the Rust backend ``pepcluster._core.refine_clusters`` is a
@@ -269,6 +269,11 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
         mapping:       dict[str, str]  unique anchor -> centroid
         threshold:     float           same threshold used during clustering
         iterations:    int             max refinement passes
+        cap:           int             max centroid comparisons per anchor in
+                                       the reassignment step (candidate cap;
+                                       own-block-first, largest-cluster-first).
+                                       <= 0 means no cap.
+        merge:         bool            run the centroid-merge sub-step
         verbose:       bool            print per-pass stats
 
     Returns:
@@ -301,6 +306,9 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
             if len(mems) == 1:
                 centroid_remap[centroid] = centroid
                 continue
+            # Canonical member order (anchor ascending) so the medoid argmax
+            # and its ties resolve identically to the Rust backend.
+            mems = sorted(mems)
             best_member = centroid
             best_score = -1e18
             for i, mi in enumerate(mems):
@@ -325,17 +333,25 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
         total_medoid_changes += pass_medoid_changes
         cur_mapping = {a: centroid_remap[c] for a, c in cur_mapping.items()}
 
-        # ── 2. Cross-block reassignment ────────────────────────────────
-        centroids_in_block = defaultdict(list)
-        for c in set(cur_mapping.values()):
-            centroids_in_block[block_key_fast(str_to_ords[c])].append(c)
+        # ── 2. Cross-block reassignment (candidate-capped) ─────────────
+        members = cluster_members(cur_mapping)
+        centroid_freq = {c: sum(anchor_counts[m] for m in mems)
+                         for c, mems in members.items()}
 
-        all_blocks = list(centroids_in_block.keys())
+        centroids_in_block = defaultdict(list)
+        for c in centroid_freq:
+            centroids_in_block[block_key_fast(str_to_ords[c])].append(c)
+        # Larger clusters first, then anchor asc — deterministic order that
+        # matches the Rust backend exactly (required once we cap the scan).
+        for v in centroids_in_block.values():
+            v.sort(key=lambda c: (-centroid_freq[c], c))
+
+        sorted_blocks = sorted(centroids_in_block.keys())
         neighbours_of = {}
-        for bk in all_blocks:
+        for bk in centroids_in_block:
             p, q = bk
-            neighbours_of[bk] = [b for b in all_blocks
-                                 if b[0] == p or b[1] == q]
+            neighbours_of[bk] = [bk] + [b for b in sorted_blocks
+                                        if b != bk and (b[0] == p or b[1] == q)]
 
         pass_reassigns = 0
         for a in anchor_counts:
@@ -344,11 +360,19 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
             cur_c = cur_mapping[a]
             cur_score = anchor_sim_fast(a_ords, str_to_ords[cur_c], -1.0)
             best_c, best_score = cur_c, cur_score
-            for nb in neighbours_of.get(bk, [bk]):
-                for c in centroids_in_block[nb]:
+            examined = 0
+            stop = False
+            for nb in neighbours_of.get(bk, ()):
+                if stop:
+                    break
+                for c in centroids_in_block.get(nb, ()):
                     if c == cur_c:
                         continue
+                    if cap > 0 and examined >= cap:
+                        stop = True
+                        break
                     sc = anchor_sim_fast(a_ords, str_to_ords[c], threshold)
+                    examined += 1
                     if sc < 0:
                         continue
                     if sc > best_score:
@@ -360,46 +384,47 @@ def refine_clusters_py(anchor_counts, mapping, threshold,
                 changed = True
         total_reassignments += pass_reassigns
 
-        # ── 3. Centroid merge ──────────────────────────────────────────
-        members = cluster_members(cur_mapping)
-        centroid_freq = {c: sum(anchor_counts[m] for m in mems)
-                         for c, mems in members.items()}
-        sorted_cents = sorted(centroid_freq.keys(),
-                              key=lambda c: -centroid_freq[c])
-        centroids_in_block = defaultdict(list)
-        block_of = {}
-        for c in sorted_cents:
-            bk = block_key_fast(str_to_ords[c])
-            centroids_in_block[bk].append(c)
-            block_of[c] = bk
-
+        # ── 3. Centroid merge (optional; skipped when merge=False) ─────
         merge_map = {}    # absorbed centroid -> absorbing centroid
-        absorbed = set()
-        for c1 in sorted_cents:
-            if c1 in absorbed:
-                continue
-            p1, q1 = block_of[c1]
-            for bk2 in (b for b in centroids_in_block
-                        if b[0] == p1 or b[1] == q1):
-                for c2 in centroids_in_block[bk2]:
-                    if c2 == c1 or c2 in absorbed:
-                        continue
-                    if centroid_freq[c2] >= centroid_freq[c1]:
-                        continue  # only smaller absorbed into larger
-                    sc = anchor_sim_fast(str_to_ords[c1], str_to_ords[c2],
-                                         threshold)
-                    if sc >= threshold:
-                        merge_map[c2] = c1
-                        absorbed.add(c2)
-                        total_merges += 1
-                        changed = True
+        if merge:
+            members = cluster_members(cur_mapping)
+            centroid_freq = {c: sum(anchor_counts[m] for m in mems)
+                             for c, mems in members.items()}
+            sorted_cents = sorted(centroid_freq.keys(),
+                                  key=lambda c: (-centroid_freq[c], c))
+            centroids_in_block = defaultdict(list)
+            block_of = {}
+            for c in sorted_cents:
+                bk = block_key_fast(str_to_ords[c])
+                centroids_in_block[bk].append(c)
+                block_of[c] = bk
 
-        if merge_map:
-            def resolve(c):
-                while c in merge_map:
-                    c = merge_map[c]
-                return c
-            cur_mapping = {a: resolve(c) for a, c in cur_mapping.items()}
+            absorbed = set()
+            for c1 in sorted_cents:
+                if c1 in absorbed:
+                    continue
+                p1, q1 = block_of[c1]
+                for bk2 in (b for b in centroids_in_block
+                            if b[0] == p1 or b[1] == q1):
+                    for c2 in centroids_in_block[bk2]:
+                        if c2 == c1 or c2 in absorbed:
+                            continue
+                        if centroid_freq[c2] >= centroid_freq[c1]:
+                            continue  # only smaller absorbed into larger
+                        sc = anchor_sim_fast(str_to_ords[c1], str_to_ords[c2],
+                                             threshold)
+                        if sc >= threshold:
+                            merge_map[c2] = c1
+                            absorbed.add(c2)
+                            total_merges += 1
+                            changed = True
+
+            if merge_map:
+                def resolve(c):
+                    while c in merge_map:
+                        c = merge_map[c]
+                    return c
+                cur_mapping = {a: resolve(c) for a, c in cur_mapping.items()}
 
         if verbose:
             n_now = len(set(cur_mapping.values()))
@@ -536,7 +561,7 @@ def _resolve_backend(backend="auto"):
 
 def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                   n_front=3, n_back=3, refinement=False, iterations=3,
-                  backend="auto", verbose=True):
+                  refine_cap=32, merge=True, backend="auto", verbose=True):
     """
     Run the full anchor-clustering pipeline on a FASTA file.
 
@@ -556,6 +581,9 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         n_back:           C-terminal anchor length (default 3)
         refinement:       apply Lloyd-style refinement after greedy clustering
         iterations:       max refinement passes (only if refinement=True)
+        refine_cap:       max centroid comparisons per anchor during refinement
+                          reassignment (default 32; <= 0 = no cap)
+        merge:            run the refinement centroid-merge step (default True)
         backend:          "auto" | "rust" | "python"
         verbose:          print progress to stdout
 
@@ -614,9 +642,10 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
     refine_stats = None
     if refinement:
         log(f"\n[2.5/4] Refining clusters (max {iterations} passes, "
+            f"cap {refine_cap}, merge {'on' if merge else 'off'}, "
             f"backend: {backend_name}) …", flush=True)
         mapping, refine_stats = refine_fn(
-            dict(acounts), mapping, threshold, iterations)
+            dict(acounts), mapping, threshold, iterations, refine_cap, merge)
         log(f"      passes run:      {refine_stats['passes']}")
         log(f"      medoid changes:  {refine_stats['medoid_changes']:,}")
         log(f"      reassignments:   {refine_stats['reassignments']:,}")

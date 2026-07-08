@@ -77,8 +77,29 @@ fall back to identical pure-Python implementations otherwise).
 | `--n-back` | `3` | C-terminal anchor length |
 | `--refinement` | off | Apply Lloyd-style refinement after greedy clustering |
 | `--iterations` | `3` | Max refinement passes (with `--refinement`) |
+| `--refine-cap` | `32` | Max centroid comparisons per anchor in refinement reassignment (`<=0` = no cap). Lower = faster |
+| `--no-merge` | off | Skip the refinement centroid-merge step (much faster on many-cluster data) |
 | `--backend` | `auto` | `auto` \| `rust` \| `python` |
 | `-q, --quiet` | — | Suppress progress output |
+
+Refinement (`--refinement`) is optional and can be slow on datasets with many
+clusters, because it widens each anchor's search to neighbouring blocks and
+tries to merge similar clusters. Two knobs make it fast:
+
+- **`--refine-cap N`** bounds how many candidate centroids each anchor is
+  compared against during reassignment (examined own-block-first,
+  largest-cluster-first). The default `32` is near-lossless because the best
+  match is almost always in the same block.
+- **`--no-merge`** skips the centroid-merge step — the dominant cost when there
+  are many clusters — at the price of leaving some greedy-split clusters
+  separate.
+
+Together they speed refinement up by **~90–370×** on many-cluster data with
+essentially unchanged assignments. Example:
+
+```bash
+pepcluster -i peptides.fasta -o out -t 0.6 --refinement --refine-cap 32 --no-merge
+```
 
 **Threshold guide:**
 

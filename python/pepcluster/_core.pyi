@@ -18,8 +18,14 @@ def refine_clusters(
     mapping: Dict[str, str],
     threshold: float,
     iterations: int,
+    cap: int = 32,
+    merge: bool = True,
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     """Lloyd-style refinement of an existing clustering.
+
+    ``cap`` bounds the centroid comparisons per anchor in the reassignment step
+    (candidates examined own-block-first, largest-cluster-first; ``<= 0`` means
+    no cap). ``merge`` toggles the centroid-merge sub-step.
 
     Returns ``(refined_mapping, stats)``. ``stats`` has keys: ``passes``,
     ``medoid_changes``, ``reassignments``, ``merges``, ``initial_clusters``,

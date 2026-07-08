@@ -63,6 +63,48 @@ def test_rust_python_refine_parity():
     assert rs_stats["final_clusters"] == py_stats["final_clusters"]
 
 
+def _random_counts(n_unique, seed):
+    import random
+    rng = random.Random(seed)
+    aa = "ARNDCQEGHILKMFPSTWYV"
+    s = set()
+    while len(s) < n_unique:
+        s.add("".join(rng.choice(aa) for _ in range(6)))
+    return {a: rng.randint(1, 5) for a in s}
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("thr", [0.3, 0.6])
+@pytest.mark.parametrize("cap,merge", [(32, True), (8, True), (0, True),
+                                       (32, False), (0, False)])
+def test_rust_python_refine_parity_random(thr, cap, merge):
+    """The capped/merge-optional refinement must be bit-identical across the
+    Rust and Python backends on random data (needs matching candidate order)."""
+    counts = _random_counts(3000, seed=1)
+    base, _, _ = cluster_anchors_py(counts, thr)
+    py_map, py_stats = refine_clusters_py(counts, base, thr, 3, cap, merge)
+    rs_map, rs_stats = pepcluster.refine_clusters(counts, base, thr, 3, cap, merge)
+    assert rs_map == py_map
+    assert dict(rs_stats) == dict(py_stats)
+
+
+def test_no_merge_and_cap_semantics():
+    """--no-merge yields zero merges (and >= clusters); a tiny cap still runs."""
+    counts = _random_counts(2000, seed=7)
+    base, _, _ = cluster_anchors_py(counts, 0.5)
+
+    _m, s_merge = refine_clusters_py(counts, base, 0.5, 3, 32, True)
+    _m, s_nomerge = refine_clusters_py(counts, base, 0.5, 3, 32, False)
+    assert s_nomerge["merges"] == 0
+    assert s_nomerge["final_clusters"] >= s_merge["final_clusters"]
+
+    # An unbounded cap examines at least as much as a tiny cap (never fewer
+    # reassignments than the capped run misses out on is not guaranteed, but
+    # both must complete and stay valid mappings).
+    m_cap, _ = refine_clusters_py(counts, base, 0.5, 1, 4, True)
+    assert set(m_cap) == set(counts)
+
+
 def test_cluster_fasta_writes_outputs(tmp_path):
     stats = pepcluster.cluster_fasta(
         str(EXAMPLE), str(tmp_path), threshold=THRESHOLD, verbose=False)
