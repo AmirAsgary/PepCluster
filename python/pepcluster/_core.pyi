@@ -1,12 +1,18 @@
 """Type stubs for the compiled Rust extension ``pepcluster._core``."""
 
-from typing import Dict, Tuple
+from typing import Dict, Sequence, Tuple
 
 def cluster_anchors(
     anchor_counts: Dict[str, int],
     threshold: float,
+    anchor_positions: Sequence[int] = ...,
+    anchor_weight: float = 2.0,
 ) -> Tuple[Dict[str, str], int, int]:
-    """Greedy centroid clustering of unique 6-mer anchors.
+    """Greedy centroid clustering of unique anchors.
+
+    ``anchor_positions`` are 0-based positions within the anchor that count as
+    binding anchors: they carry ``anchor_weight`` in the similarity and define
+    the coarse-alphabet blocking (default ``[1, 5]`` = P2 and PΩ of a 6-mer).
 
     Returns ``(mapping, n_comparisons, n_early_exits)`` where ``mapping`` maps
     each anchor to its centroid anchor.
@@ -20,12 +26,15 @@ def refine_clusters(
     iterations: int,
     cap: int = 32,
     merge: bool = True,
+    anchor_positions: Sequence[int] = ...,
+    anchor_weight: float = 2.0,
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     """Lloyd-style refinement of an existing clustering.
 
     ``cap`` bounds the centroid comparisons per anchor in the reassignment step
     (candidates examined own-block-first, largest-cluster-first; ``<= 0`` means
-    no cap). ``merge`` toggles the centroid-merge sub-step.
+    no cap). ``merge`` toggles the centroid-merge sub-step. ``anchor_positions``
+    / ``anchor_weight`` must match those used for clustering.
 
     Returns ``(refined_mapping, stats)``. ``stats`` has keys: ``passes``,
     ``medoid_changes``, ``reassignments``, ``merges``, ``initial_clusters``,

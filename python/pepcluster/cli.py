@@ -26,6 +26,17 @@ def main(argv=None):
                     help="N-terminal anchor length (default: 3)")
     ap.add_argument("--n-back", type=int, default=3,
                     help="C-terminal anchor length (default: 3)")
+    ap.add_argument("--anchors", default="2;3",
+                    help="Which positions are binding anchors, as 'FRONT;BACK' "
+                         "with 1-based indices into each side (default: '2;3' "
+                         "= 2nd of the first 3 residues (P2) and 3rd of the "
+                         "last 3 (POmega)). Each side takes a comma-separated "
+                         "list and may be empty, e.g. '2;2,3', '1,2;3', ';3'. "
+                         "Anchor positions get --anchor-weight and define the "
+                         "blocking")
+    ap.add_argument("--anchor-weight", type=float, default=2.0,
+                    help="Weight given to anchor positions; all other "
+                         "positions have weight 1.0 (default: 2.0)")
     ap.add_argument("--refinement", action="store_true",
                     help="Apply Lloyd-style refinement after greedy "
                          "clustering (off by default)")
@@ -49,20 +60,25 @@ def main(argv=None):
                     version=f"pepcluster {__version__}")
     args = ap.parse_args(argv)
 
-    cluster_fasta(
-        input=args.input,
-        outdir=args.outdir,
-        threshold=args.threshold,
-        min_cluster_size=args.min_cluster_size,
-        n_front=args.n_front,
-        n_back=args.n_back,
-        refinement=args.refinement,
-        iterations=args.iterations,
-        refine_cap=args.refine_cap,
-        merge=not args.no_merge,
-        backend=args.backend,
-        verbose=not args.quiet,
-    )
+    try:
+        cluster_fasta(
+            input=args.input,
+            outdir=args.outdir,
+            threshold=args.threshold,
+            min_cluster_size=args.min_cluster_size,
+            n_front=args.n_front,
+            n_back=args.n_back,
+            anchors=args.anchors,
+            anchor_weight=args.anchor_weight,
+            refinement=args.refinement,
+            iterations=args.iterations,
+            refine_cap=args.refine_cap,
+            merge=not args.no_merge,
+            backend=args.backend,
+            verbose=not args.quiet,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":

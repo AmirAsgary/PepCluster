@@ -75,6 +75,8 @@ fall back to identical pure-Python implementations otherwise).
 | `--min-cluster-size` | `2` | Min members for a per-cluster FASTA |
 | `--n-front` | `3` | N-terminal anchor length |
 | `--n-back` | `3` | C-terminal anchor length |
+| `--anchors` | `"2;3"` | Which positions are binding anchors, as `FRONT;BACK` (1-based per side). See [Choosing the anchors](#choosing-the-anchors) |
+| `--anchor-weight` | `2.0` | Weight given to anchor positions (all others are `1.0`) |
 | `--refinement` | off | Apply Lloyd-style refinement after greedy clustering |
 | `--iterations` | `3` | Max refinement passes (with `--refinement`) |
 | `--refine-cap` | `32` | Max centroid comparisons per anchor in refinement reassignment (`<=0` = no cap). Lower = faster |
@@ -111,6 +113,43 @@ pepcluster -i peptides.fasta -o out -t 0.6 --refinement --refine-cap 32 --no-mer
 
 ---
 
+## Choosing the anchors
+
+The anchor is the peptide's first `--n-front` + last `--n-back` residues.
+`--anchors` picks which positions *inside that anchor* are the **binding
+anchors**: they get `--anchor-weight` (default 2×) in the similarity score and
+they define the coarse-alphabet blocking.
+
+The format is **`"FRONT;BACK"`**, where each side is a comma-separated list of
+**1-based** indices into that side's residues. Either side may be empty.
+
+The default **`"2;3"`** means *the 2nd of the first 3 residues* (**P2**) and
+*the 3rd of the last 3* (**PΩ**) — the classic MHC-I anchors.
+
+| `--anchors` | Anchor positions (1-based, in the 6-mer) | Meaning |
+|-------------|------------------------------------------|---------|
+| `"2;3"` *(default)* | 2, 6 | P2 + PΩ — MHC-I |
+| `"2;2,3"` | 2, 5, 6 | P2 plus the last two C-terminal residues |
+| `"1,2;3"` | 1, 2, 6 | first two N-terminal residues plus PΩ |
+| `";3"` | 6 | C-terminal anchor only |
+| `"2;"` | 2 | N-terminal anchor only |
+
+```bash
+# emphasise P2 and the last two residues, and weight anchors 3x
+pepcluster -i peptides.fasta -o out --anchors "2;2,3" --anchor-weight 3
+```
+
+Anchor positions are indexed **relative to `--n-front` / `--n-back`**, so the
+two work together — e.g. a 2+2 anchor with anchors at the 2nd of each side:
+
+```bash
+pepcluster -i peptides.fasta -o out --n-front 2 --n-back 2 --anchors "2;2"
+```
+
+Up to 8 anchor positions are supported (they form the blocking key).
+
+---
+
 ## Output files
 
 ```
@@ -134,18 +173,20 @@ real member sequence, so it's a good label or seed for each cluster.
 
 ## How it works
 
-1. **Anchor extraction.** Each peptide is reduced to its 6-residue anchor: the
-   first `--n-front` (3) and last `--n-back` (3) amino acids. Peptides shorter
-   than that are set aside in `SHORT_peptides.fasta`.
+1. **Anchor extraction.** Each peptide is reduced to its anchor: the first
+   `--n-front` (3) and last `--n-back` (3) amino acids. Peptides shorter than
+   that are set aside in `SHORT_peptides.fasta`.
 2. **Deduplicate.** Peptides are grouped by their exact anchor, so clustering
    operates on *unique* anchors weighted by frequency.
 3. **Similarity metric.** Two anchors are compared position-by-position with a
    BLOSUM62 score normalized to `sim(a,b) = B(a,b) / sqrt(B(a,a)·B(b,b))`.
-   Positions **P2 and PΩ carry 2× weight** (the primary MHC-I anchors); the
-   score is a weighted mean in `[−…, 1]`.
+   The **anchor positions** (`--anchors`, default P2 and PΩ) carry
+   `--anchor-weight` (default 2×); every other position carries 1×. The score
+   is a weighted mean in `[−…, 1]`.
 4. **Blocking.** Unique anchors are bucketed by a reduced 10-letter alphabet at
-   P2 and PΩ (10×10 = 100 bins), so only plausibly-similar anchors are ever
-   compared. High-weight positions are checked first with early termination.
+   the anchor positions (10ᵏ bins for k anchors — 100 by default), so only
+   plausibly-similar anchors are ever compared. High-weight positions are
+   checked first with early termination.
 5. **Greedy clustering.** Within each block, anchors are processed
    most-frequent-first; each joins the first centroid above `threshold` or
    becomes a new centroid.
@@ -153,8 +194,10 @@ real member sequence, so it's a good label or seed for each cluster.
    medoid update → cross-block reassignment → centroid merging, until stable.
 
 The Rust backend (`pepcluster._core`) and the pure-Python reference
-(`pepcluster.clustering`) implement identical logic and produce identical
-cluster assignments; the test suite asserts this parity.
+(`pepcluster.clustering`) implement identical logic — both compute in f64 with
+identical, deterministic orderings — and produce **bit-identical** cluster
+assignments; the test suite asserts this parity across anchor lengths,
+positions and weights.
 
 ---
 

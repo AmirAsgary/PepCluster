@@ -25,10 +25,15 @@ from .clustering import (
     refine_clusters_py,
     extract_anchor,
     parse_fasta,
+    parse_anchors,
+    build_tables,
     anchor_sim_fast,
+    DEFAULT_ANCHOR_SPEC,
+    DEFAULT_ANCHOR_POSITIONS,
+    DEFAULT_ANCHOR_WEIGHT,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # Prefer the compiled Rust backend; fall back to the pure-Python reference.
 try:
@@ -52,5 +57,10 @@ __all__ = [
     "refine_clusters_py",
     "extract_anchor",
     "parse_fasta",
+    "parse_anchors",
+    "build_tables",
     "anchor_sim_fast",
+    "DEFAULT_ANCHOR_SPEC",
+    "DEFAULT_ANCHOR_POSITIONS",
+    "DEFAULT_ANCHOR_WEIGHT",
 ]
