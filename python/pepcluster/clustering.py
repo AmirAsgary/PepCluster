@@ -380,10 +380,79 @@ def cluster_anchors_py(anchor_counts, threshold,
 # Optional refinement (Lloyd-style)
 # ============================================================================
 
+def _medoid_exact(mems, str_to_ords, anchor_counts, centroid, tables):
+    """Exact O(k^2) medoid: member with the highest frequency-weighted average
+    similarity to the others. ``mems`` must be anchor-sorted (tie -> smallest)."""
+    best_member = centroid
+    best_score = -1e18
+    for i, mi in enumerate(mems):
+        ords_i = str_to_ords[mi]
+        s = 0.0
+        w = 0.0
+        for j, mj in enumerate(mems):
+            if i == j:
+                continue
+            sim = anchor_sim_fast(ords_i, str_to_ords[mj], -1.0, tables)
+            fj = anchor_counts[mj]
+            s += fj * sim
+            w += fj
+        avg = s / w if w > 0 else 0.0
+        if avg > best_score:
+            best_score = avg
+            best_member = mi
+    return best_member
+
+
+def _medoid_fast(mems, str_to_ords, anchor_counts, centroid, tables):
+    """O(k) medoid via the additive per-position decomposition (see
+    :func:`cluster_representatives`). Bit-identical to the Rust ``medoid_fast``:
+    present residues are summed in ascending byte order, ``mems`` anchor-sorted.
+
+    avg(i) = (Sigma(i) - f_i) / (F - f_i),  Sigma(i) = sum_p S_p[a_i[p]],
+    S_p[x] = sum_aa freq_p[aa] * wsim_by_pos[p][x*128 + aa].
+    """
+    alen = tables.alen
+    wsim_by_pos = tables.wsim_by_pos
+    total_f = sum(anchor_counts[m] for m in mems)
+    total_ff = float(total_f)
+
+    s_tables = []
+    for p in range(alen):
+        freq_res = defaultdict(int)
+        for m in mems:
+            freq_res[ord(m[p])] += anchor_counts[m]
+        present = sorted(freq_res.keys())  # ascending byte order
+        wp = wsim_by_pos[p]
+        tbl = {}
+        for x in present:
+            base = x * 128
+            sx = 0.0
+            for aa in present:
+                sx += freq_res[aa] * wp[base + aa]
+            tbl[x] = sx
+        s_tables.append(tbl)
+
+    best_member = centroid
+    best_score = -1e18
+    for mi in mems:
+        ords_i = str_to_ords[mi]
+        sigma = 0.0
+        for p in range(alen):
+            sigma += s_tables[p][ords_i[p]]
+        fi = anchor_counts[mi]
+        denom = total_ff - fi
+        avg = (sigma - fi) / denom if denom > 0 else 0.0
+        if avg > best_score:
+            best_score = avg
+            best_member = mi
+    return best_member
+
+
 def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
                        cap=32, merge=True,
                        anchor_positions=DEFAULT_ANCHOR_POSITIONS,
-                       anchor_weight=DEFAULT_ANCHOR_WEIGHT, verbose=False):
+                       anchor_weight=DEFAULT_ANCHOR_WEIGHT,
+                       fast_medoid=False, merge_cap=0, verbose=False):
     """
     Lloyd-style refinement on top of greedy clustering output (pure-Python
     reference; the Rust backend ``pepcluster._core.refine_clusters`` is a
@@ -416,6 +485,13 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
         merge:            bool            run the centroid-merge sub-step
         anchor_positions: 0-based anchor positions
         anchor_weight:    weight of anchor positions
+        fast_medoid:      bool            use the O(N) per-position medoid
+                                          decomposition instead of the exact
+                                          O(k^2) all-pairs medoid (much faster
+                                          on very large clusters)
+        merge_cap:        int             max candidate centroids examined per
+                                          centroid in the merge step (own-block
+                                          first, largest first). <= 0 = no cap.
         verbose:          bool            print per-pass stats
 
     Returns:
@@ -457,23 +533,12 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
             # Canonical member order (anchor ascending) so the medoid argmax
             # and its ties resolve identically to the Rust backend.
             mems = sorted(mems)
-            best_member = centroid
-            best_score = -1e18
-            for i, mi in enumerate(mems):
-                ords_i = str_to_ords[mi]
-                s = 0.0
-                w = 0.0
-                for j, mj in enumerate(mems):
-                    if i == j:
-                        continue
-                    sim = anchor_sim_fast(ords_i, str_to_ords[mj], -1.0, tables)
-                    fj = anchor_counts[mj]
-                    s += fj * sim
-                    w += fj
-                avg = s / w if w > 0 else 0.0
-                if avg > best_score:
-                    best_score = avg
-                    best_member = mi
+            if fast_medoid:
+                best_member = _medoid_fast(mems, str_to_ords, anchor_counts,
+                                           centroid, tables)
+            else:
+                best_member = _medoid_exact(mems, str_to_ords, anchor_counts,
+                                            centroid, tables)
             centroid_remap[centroid] = best_member
             if best_member != centroid:
                 pass_medoid_changes += 1
@@ -540,6 +605,8 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
                              for c, mems in members.items()}
             sorted_cents = sorted(centroid_freq.keys(),
                                   key=lambda c: (-centroid_freq[c], c))
+            # Blocks hold centroids in sorted_cents order (freq desc, anchor
+            # asc) already, so each block's candidate list is largest-first.
             centroids_in_block = defaultdict(list)
             block_of = {}
             for c in sorted_cents:
@@ -547,15 +614,33 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
                 centroids_in_block[bk].append(c)
                 block_of[c] = bk
 
+            # Own block first, then neighbour blocks in sorted order — same
+            # deterministic traversal as reassignment, so the merge cap is
+            # bit-identical to Rust (and unchanged when uncapped).
+            sorted_blocks = sorted(centroids_in_block.keys())
+            neighbours_of = {}
+            for bk in centroids_in_block:
+                neighbours_of[bk] = [bk] + [b for b in sorted_blocks
+                                            if b != bk and _is_neighbour(bk, b, n_ap)]
+
             absorbed = set()
             for c1 in sorted_cents:
                 if c1 in absorbed:
                     continue
                 bk1 = block_of[c1]
-                for bk2 in (b for b in centroids_in_block
-                            if _is_neighbour(bk1, b, n_ap)):
-                    for c2 in centroids_in_block[bk2]:
-                        if c2 == c1 or c2 in absorbed:
+                examined = 0
+                stop = False
+                for bk2 in neighbours_of[bk1]:
+                    if stop:
+                        break
+                    for c2 in centroids_in_block.get(bk2, ()):
+                        if c2 == c1:
+                            continue
+                        if merge_cap > 0 and examined >= merge_cap:
+                            stop = True
+                            break
+                        examined += 1
+                        if c2 in absorbed:
                             continue
                         if centroid_freq[c2] >= centroid_freq[c1]:
                             continue  # only smaller absorbed into larger
@@ -710,7 +795,8 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                   anchors=DEFAULT_ANCHOR_SPEC,
                   anchor_weight=DEFAULT_ANCHOR_WEIGHT,
                   refinement=False, iterations=3,
-                  refine_cap=32, merge=True, backend="auto", verbose=True):
+                  refine_cap=32, merge=True, fast_medoid=False, merge_cap=0,
+                  backend="auto", verbose=True):
     """
     Run the full anchor-clustering pipeline on a FASTA file.
 
@@ -738,6 +824,13 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         refine_cap:       max centroid comparisons per anchor during refinement
                           reassignment (default 32; <= 0 = no cap)
         merge:            run the refinement centroid-merge step (default True)
+        fast_medoid:      use the O(N) medoid decomposition instead of the exact
+                          O(k^2) medoid (default False; much faster when a few
+                          clusters are very large, e.g. low thresholds)
+        merge_cap:        max candidate centroids examined per centroid in the
+                          merge step (default 0 = no cap; a positive value such
+                          as 32 makes merge fast when there are many clusters,
+                          e.g. high thresholds)
         backend:          "auto" | "rust" | "python"
         verbose:          print progress to stdout
 
@@ -811,11 +904,13 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
     refine_stats = None
     if refinement:
         log(f"\n[2.5/4] Refining clusters (max {iterations} passes, "
-            f"cap {refine_cap}, merge {'on' if merge else 'off'}, "
+            f"cap {refine_cap}, merge {'on' if merge else 'off'}"
+            f"{f' (cap {merge_cap})' if merge and merge_cap > 0 else ''}, "
+            f"medoid {'fast' if fast_medoid else 'exact'}, "
             f"backend: {backend_name}) …", flush=True)
         mapping, refine_stats = refine_fn(
             dict(acounts), mapping, threshold, iterations, refine_cap, merge,
-            anchor_positions, anchor_weight)
+            anchor_positions, anchor_weight, fast_medoid, merge_cap)
         log(f"      passes run:      {refine_stats['passes']}")
         log(f"      medoid changes:  {refine_stats['medoid_changes']:,}")
         log(f"      reassignments:   {refine_stats['reassignments']:,}")
@@ -910,7 +1005,9 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
             f"    Backend:           {backend_name}",
             f"    Max iterations:    {iterations}",
             f"    Candidate cap:     {refine_cap}",
-            f"    Merge step:        {'on' if merge else 'off'}",
+            f"    Medoid:            {'fast (O(N))' if fast_medoid else 'exact (O(k^2))'}",
+            f"    Merge step:        {'on' if merge else 'off'}"
+            + (f"  (cap {merge_cap})" if merge and merge_cap > 0 else ""),
             f"    Passes run:        {refine_stats['passes']}",
             f"    Medoid changes:    {refine_stats['medoid_changes']:,}",
             f"    Reassignments:     {refine_stats['reassignments']:,}",

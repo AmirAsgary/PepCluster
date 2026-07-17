@@ -81,27 +81,39 @@ fall back to identical pure-Python implementations otherwise).
 | `--iterations` | `3` | Max refinement passes (with `--refinement`) |
 | `--refine-cap` | `32` | Max centroid comparisons per anchor in refinement reassignment (`<=0` = no cap). Lower = faster |
 | `--no-merge` | off | Skip the refinement centroid-merge step (much faster on many-cluster data) |
+| `--fast-medoid` | off | O(N) medoid instead of exact O(k²) (much faster when a few clusters are huge) |
+| `--merge-cap` | `0` | Cap candidate centroids per cluster in the merge step (`0` = no cap; e.g. `32` on many-cluster data) |
 | `--backend` | `auto` | `auto` \| `rust` \| `python` |
 | `-q, --quiet` | — | Suppress progress output |
 
-Refinement (`--refinement`) is optional and can be slow on datasets with many
-clusters, because it widens each anchor's search to neighbouring blocks and
-tries to merge similar clusters. Two knobs make it fast:
+### Making refinement fast
 
-- **`--refine-cap N`** bounds how many candidate centroids each anchor is
-  compared against during reassignment (examined own-block-first,
-  largest-cluster-first). The default `32` is near-lossless because the best
-  match is almost always in the same block.
-- **`--no-merge`** skips the centroid-merge step — the dominant cost when there
-  are many clusters — at the price of leaving some greedy-split clusters
-  separate.
+Refinement (`--refinement`) has three sub-steps, and **two of them are quadratic
+by default** — which is fine at moderate thresholds but blows up at the extremes:
 
-Together they speed refinement up by **~90–370×** on many-cluster data with
-essentially unchanged assignments. Example:
+| Sub-step | Cost (default) | Blows up when… | Fast flag |
+|----------|----------------|----------------|-----------|
+| medoid update | O(k²) per cluster | a few clusters are **huge** (low threshold) | `--fast-medoid` → O(N) |
+| reassignment | O(cap) per anchor | *(already capped)* | `--refine-cap` |
+| merge | O(clusters × neighbours) | there are **many** clusters (high threshold) | `--merge-cap N` (or `--no-merge`) |
+
+- **`--refine-cap N`** bounds candidate centroids per anchor in reassignment
+  (own-block-first, largest-cluster-first). Default `32` is near-lossless.
+- **`--fast-medoid`** replaces the exact all-pairs medoid with an O(N)
+  per-position decomposition. On a single cluster of 30k anchors it is ~470×
+  faster (and the gap grows quadratically with cluster size).
+- **`--merge-cap N`** bounds candidate centroids per cluster in the merge step
+  (~130× faster with ~1M clusters). **`--no-merge`** skips merging entirely.
+
+For a huge dataset, turn all three on so every sub-step is bounded:
 
 ```bash
-pepcluster -i peptides.fasta -o out -t 0.6 --refinement --refine-cap 32 --no-merge
+pepcluster -i peptides.fasta -o out -t 0.6 --refinement \
+    --fast-medoid --refine-cap 32 --merge-cap 32
 ```
+
+Defaults are unchanged (exact medoid, uncapped merge) for backward
+compatibility — the fast paths are opt-in.
 
 **Threshold guide:**
 

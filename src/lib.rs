@@ -65,9 +65,10 @@ struct SimTables {
     /// Positions in check order: highest weight first, so early termination
     /// kicks in sooner. Ties broken by position ascending (deterministic).
     check_pos: Vec<usize>,
-    /// wsim_ord[k][a * 128 + b] = normalized BLOSUM62 * weight for the position
-    /// check_pos[k]. f64 (not f32) so the arithmetic is bit-identical to Python.
-    wsim_ord: Vec<Vec<f64>>,
+    /// wsim_by_pos[p][a * 128 + b] = normalized BLOSUM62 * weight for position
+    /// `p`. f64 (not f32) so the arithmetic is bit-identical to Python. Indexed
+    /// by anchor position so the O(N) medoid decomposition can use it directly.
+    wsim_by_pos: Vec<Vec<f64>>,
     /// remaining_after[k] = max score still obtainable from check_pos[k..].
     remaining_after: Vec<f64>,
     /// coarse group id for each ASCII byte (0..9), 255 = unknown
@@ -114,9 +115,9 @@ impl SimTables {
             raw[b].partial_cmp(&raw[a]).unwrap().then(a.cmp(&b))
         });
 
-        // Weighted similarity tables, stored in check order.
-        let mut wsim_ord: Vec<Vec<f64>> = Vec::with_capacity(alen);
-        for &pos in check_pos.iter() {
+        // Weighted similarity tables, one per position (weight baked in).
+        let mut wsim_by_pos: Vec<Vec<f64>> = Vec::with_capacity(alen);
+        for pos in 0..alen {
             let w = raw[pos] / wsum;
             let mut t = vec![0.0f64; 128 * 128];
             for &a in AA_ORDER.iter() {
@@ -126,7 +127,7 @@ impl SimTables {
                     t[(a as usize) * 128 + (b as usize)] = w * norm_sim[ai][bi];
                 }
             }
-            wsim_ord.push(t);
+            wsim_by_pos.push(t);
         }
 
         // remaining_after[k] = sum of normalized weights of check_pos[k..]
@@ -146,7 +147,7 @@ impl SimTables {
         SimTables {
             alen,
             check_pos,
-            wsim_ord,
+            wsim_by_pos,
             remaining_after,
             coarse,
             anchor_positions: anchor_positions.to_vec(),
@@ -155,13 +156,14 @@ impl SimTables {
 
     /// Weighted BLOSUM62-normalized similarity with early termination.
     /// Returns the score, or -1.0 if it cannot possibly reach `threshold`.
+    /// Positions are summed in check order (heaviest first) — same as Python.
     #[inline]
     fn anchor_sim(&self, a: &[u8], b: &[u8], threshold: f64) -> f64 {
         let mut s: f64 = 0.0;
         let n = self.alen;
         for k in 0..n {
             let p = self.check_pos[k];
-            s += self.wsim_ord[k][(a[p] as usize) * 128 + (b[p] as usize)];
+            s += self.wsim_by_pos[p][(a[p] as usize) * 128 + (b[p] as usize)];
             if k + 1 < n && s + self.remaining_after[k + 1] < threshold {
                 return -1.0;
             }
@@ -175,7 +177,7 @@ impl SimTables {
         let mut s: f64 = 0.0;
         for k in 0..self.alen {
             let p = self.check_pos[k];
-            s += self.wsim_ord[k][(a[p] as usize) * 128 + (b[p] as usize)];
+            s += self.wsim_by_pos[p][(a[p] as usize) * 128 + (b[p] as usize)];
         }
         s
     }
@@ -209,6 +211,82 @@ impl SimTables {
 #[inline]
 fn arow(flat: &[u8], i: usize, alen: usize) -> &[u8] {
     &flat[i * alen..(i + 1) * alen]
+}
+
+/// Exact medoid of a cluster: the member with the highest frequency-weighted
+/// average similarity to the others. O(k^2). `mems` must be anchor-sorted so
+/// the strict-`>` argmax breaks ties toward the smallest anchor (matches Python).
+fn medoid_exact(tables: &SimTables, flat: &[u8], freqs: &[u64],
+                mems: &[usize], centroid: usize) -> usize {
+    let alen = tables.alen;
+    let mut best_member = centroid;
+    let mut best_score: f64 = f64::NEG_INFINITY;
+    for &i in mems.iter() {
+        let mut s: f64 = 0.0;
+        let mut w: f64 = 0.0;
+        for &j in mems.iter() {
+            if i == j { continue; }
+            let sim = tables.anchor_sim_full(arow(flat, i, alen), arow(flat, j, alen));
+            let fj = freqs[j] as f64;
+            s += fj * sim;
+            w += fj;
+        }
+        let avg = if w > 0.0 { s / w } else { 0.0 };
+        if avg > best_score { best_score = avg; best_member = i; }
+    }
+    best_member
+}
+
+/// O(k) medoid via the additive per-position decomposition. Since
+/// `sim(i,j) = Σ_p wsim_p(a_i[p], a_j[p])`, the total similarity of member `i`
+/// to the whole cluster is `Sigma(i) = Σ_p S_p[a_i[p]]`, where
+/// `S_p[x] = Σ_j f_j·wsim_p(x, a_j[p])`. With `sim(i,i)=1` and `F` the cluster
+/// frequency, `avg(i) = (Sigma(i) − f_i) / (F − f_i)`. No pairwise loop.
+///
+/// `mems` must be anchor-sorted, and present residues are summed in ascending
+/// byte order, so the result is bit-identical to the Python backend.
+fn medoid_fast(tables: &SimTables, flat: &[u8], freqs: &[u64],
+               mems: &[usize], centroid: usize) -> usize {
+    let alen = tables.alen;
+
+    // Total cluster frequency (exact integer sum, order-independent).
+    let mut total_f: u64 = 0;
+    for &i in mems.iter() { total_f += freqs[i]; }
+    let total_ff = total_f as f64;
+
+    // Per position: S_p[x] for each residue x that occurs there.
+    let mut s_tables: Vec<[f64; 128]> = vec![[0.0f64; 128]; alen];
+    for p in 0..alen {
+        let mut freq_res = [0u64; 128];
+        for &i in mems.iter() {
+            freq_res[arow(flat, i, alen)[p] as usize] += freqs[i];
+        }
+        let present: Vec<usize> = (0..128usize).filter(|&r| freq_res[r] > 0).collect();
+        let wp = &tables.wsim_by_pos[p];
+        for &x in present.iter() {
+            let base = x * 128;
+            let mut sx = 0.0f64;
+            for &aa in present.iter() {
+                sx += (freq_res[aa] as f64) * wp[base + aa];
+            }
+            s_tables[p][x] = sx;
+        }
+    }
+
+    let mut best_member = centroid;
+    let mut best_score: f64 = f64::NEG_INFINITY;
+    for &i in mems.iter() {
+        let anc = arow(flat, i, alen);
+        let mut sigma = 0.0f64;
+        for p in 0..alen {
+            sigma += s_tables[p][anc[p] as usize];
+        }
+        let fi = freqs[i] as f64;
+        let denom = total_ff - fi;
+        let avg = if denom > 0.0 { (sigma - fi) / denom } else { 0.0 };
+        if avg > best_score { best_score = avg; best_member = i; }
+    }
+    best_member
 }
 
 /// Validate + canonicalise (sort, dedup) the anchor positions.
@@ -399,12 +477,19 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     merge:            bool            — run the centroid-merge sub-step
 ///     anchor_positions: list[int]       — 0-based anchor positions
 ///     anchor_weight:    float           — weight of anchor positions
+///     fast_medoid:      bool            — use the O(N) per-position medoid
+///                                         decomposition instead of the exact
+///                                         O(k^2) all-pairs medoid
+///     merge_cap:        int             — max candidate centroids examined per
+///                                         centroid in the merge step (own-block
+///                                         first, largest first). <= 0 = no cap.
 ///
 /// Returns:
 ///     (refined_mapping, stats_dict)
 #[pyfunction]
 #[pyo3(signature = (anchor_counts, mapping, threshold, iterations, cap=32, merge=true,
-                    anchor_positions=vec![1, 5], anchor_weight=2.0))]
+                    anchor_positions=vec![1, 5], anchor_weight=2.0,
+                    fast_medoid=false, merge_cap=0))]
 fn refine_clusters(
     py: Python<'_>,
     anchor_counts: &Bound<'_, PyDict>,
@@ -415,6 +500,8 @@ fn refine_clusters(
     merge: bool,
     anchor_positions: Vec<usize>,
     anchor_weight: f64,
+    fast_medoid: bool,
+    merge_cap: i64,
 ) -> PyResult<(PyObject, PyObject)> {
     let (names, flat, freqs, alen) = parse_anchor_counts(anchor_counts)?;
     let n = names.len();
@@ -480,25 +567,11 @@ fn refine_clusters(
                 centroid_remap.insert(centroid, centroid);
                 continue;
             }
-            let mut best_member = centroid;
-            let mut best_score: f64 = f64::NEG_INFINITY;
-            for &i in mems.iter() {
-                let mut s: f64 = 0.0;
-                let mut w: f64 = 0.0;
-                for &j in mems.iter() {
-                    if i == j { continue; }
-                    let sim = tables.anchor_sim_full(
-                        arow(&flat, i, alen), arow(&flat, j, alen));
-                    let fj  = freqs[j] as f64;
-                    s += fj * sim;
-                    w += fj;
-                }
-                let avg = if w > 0.0 { s / w } else { 0.0 };
-                if avg > best_score {
-                    best_score  = avg;
-                    best_member = i;
-                }
-            }
+            let best_member = if fast_medoid {
+                medoid_fast(&tables, &flat, &freqs, mems, centroid)
+            } else {
+                medoid_exact(&tables, &flat, &freqs, mems, centroid)
+            };
             centroid_remap.insert(centroid, best_member);
             if best_member != centroid {
                 total_medoid_changes += 1;
@@ -599,6 +672,8 @@ fn refine_clusters(
                     .then_with(|| names[a].cmp(&names[b]))  // anchor asc (matches Python)
             });
 
+            // Blocks hold centroids in sorted_cents order (freq desc, anchor
+            // asc) already, so each block's candidate list is largest-first.
             let mut centroids_in_block: HashMap<u64, Vec<usize>> = HashMap::new();
             let mut block_of: HashMap<usize, u64> = HashMap::new();
             for &c in sorted_cents.iter() {
@@ -607,20 +682,37 @@ fn refine_clusters(
                 block_of.insert(c, bk);
             }
 
+            // Own block first, then neighbour blocks in sorted order — the same
+            // deterministic traversal the reassignment uses, so the merge cap
+            // is bit-identical across backends (and unchanged when uncapped).
+            let mut sorted_blocks: Vec<u64> =
+                centroids_in_block.keys().copied().collect();
+            sorted_blocks.sort_unstable();
+            let mut neighbours_of: HashMap<u64, Vec<u64>> = HashMap::new();
+            for &bk in centroids_in_block.keys() {
+                let mut nb: Vec<u64> = vec![bk];
+                for &b in sorted_blocks.iter() {
+                    if b != bk && tables.is_neighbour(bk, b) {
+                        nb.push(b);
+                    }
+                }
+                neighbours_of.insert(bk, nb);
+            }
+
             let mut merge_map: HashMap<usize, usize> = HashMap::new();
             let mut absorbed:  HashSet<usize>       = HashSet::new();
 
             for &c1 in sorted_cents.iter() {
                 if absorbed.contains(&c1) { continue; }
                 let bk1 = block_of[&c1];
-                let nb_keys: Vec<u64> = centroids_in_block.keys()
-                    .filter(|&&b| tables.is_neighbour(bk1, b))
-                    .copied()
-                    .collect();
-                for bk2 in &nb_keys {
-                    if let Some(centroids2) = centroids_in_block.get(bk2) {
+                let mut examined: i64 = 0;
+                'mscan: for &bk2 in neighbours_of[&bk1].iter() {
+                    if let Some(centroids2) = centroids_in_block.get(&bk2) {
                         for &c2 in centroids2 {
-                            if c2 == c1 || absorbed.contains(&c2) { continue; }
+                            if c2 == c1 { continue; }
+                            if merge_cap > 0 && examined >= merge_cap { break 'mscan; }
+                            examined += 1;
+                            if absorbed.contains(&c2) { continue; }
                             if cluster_freq[&c2] >= cluster_freq[&c1] {
                                 continue;  // only smaller absorbed into larger
                             }

@@ -50,6 +50,16 @@ def main(argv=None):
     ap.add_argument("--no-merge", action="store_true",
                     help="Skip the centroid-merge step during refinement "
                          "(faster; only used with --refinement)")
+    ap.add_argument("--fast-medoid", action="store_true",
+                    help="Use the O(N) medoid decomposition instead of the "
+                         "exact O(k^2) medoid during refinement. Much faster "
+                         "when a few clusters are very large (e.g. low "
+                         "thresholds). Only used with --refinement")
+    ap.add_argument("--merge-cap", type=int, default=0,
+                    help="Max candidate centroids examined per centroid in the "
+                         "refinement merge step (default: 0 = no cap). A value "
+                         "like 32 makes merge fast when there are many clusters "
+                         "(e.g. high thresholds). Only used with --refinement")
     ap.add_argument("--backend", choices=["auto", "rust", "python"],
                     default="auto",
                     help="Clustering backend (default: auto — Rust if built, "
@@ -74,6 +84,8 @@ def main(argv=None):
             iterations=args.iterations,
             refine_cap=args.refine_cap,
             merge=not args.no_merge,
+            fast_medoid=args.fast_medoid,
+            merge_cap=args.merge_cap,
             backend=args.backend,
             verbose=not args.quiet,
         )

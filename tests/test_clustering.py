@@ -192,6 +192,68 @@ def test_no_merge_and_cap_semantics():
     assert set(m_cap) == set(counts)
 
 
+# ── fast_medoid (O(N)) + merge_cap ─────────────────────────────────────────
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("thr", [0.3, 0.6])
+@pytest.mark.parametrize("fast_medoid", [False, True])
+@pytest.mark.parametrize("merge_cap", [0, 8, 32])
+def test_rust_python_parity_fast_medoid_and_merge_cap(thr, fast_medoid, merge_cap):
+    """New flags must stay bit-identical across the Rust and Python backends."""
+    counts = _random_counts(3000, seed=2)
+    base, _, _ = cluster_anchors_py(counts, thr)
+    py_map, py_s = refine_clusters_py(counts, base, thr, 3, 32, True,
+                                      DEFAULT_AP, 2.0, fast_medoid, merge_cap)
+    rs_map, rs_s = pepcluster.refine_clusters(counts, base, thr, 3, 32, True,
+                                              DEFAULT_AP, 2.0, fast_medoid, merge_cap)
+    assert rs_map == py_map
+    assert dict(rs_s) == dict(py_s)
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("alen,ap", [(6, [1, 5]), (4, [1, 3]), (8, [1, 7])])
+def test_fast_medoid_merge_cap_parity_custom_anchors(alen, ap):
+    counts = _random_counts(1500, seed=6, alen=alen)
+    base, _, _ = cluster_anchors_py(counts, 0.4, ap, 2.0)
+    py_map, py_s = refine_clusters_py(counts, base, 0.4, 2, 32, True, ap, 2.0,
+                                      True, 16)
+    rs_map, rs_s = pepcluster.refine_clusters(counts, base, 0.4, 2, 32, True, ap,
+                                              2.0, True, 16)
+    assert rs_map == py_map and dict(rs_s) == dict(py_s)
+
+
+def test_merge_cap_reduces_or_equals_merges():
+    """A merge cap can only find fewer-or-equal merges than the uncapped scan."""
+    counts = _random_counts(2500, seed=4)
+    base, _, _ = cluster_anchors_py(counts, 0.35)  # low thr -> mergeable clusters
+    _m, s_uncapped = refine_clusters_py(counts, base, 0.35, 1, 32, True,
+                                        DEFAULT_AP, 2.0, False, 0)
+    _m, s_capped = refine_clusters_py(counts, base, 0.35, 1, 32, True,
+                                      DEFAULT_AP, 2.0, False, 4)
+    assert s_capped["merges"] <= s_uncapped["merges"]
+    assert s_capped["final_clusters"] >= s_uncapped["final_clusters"]
+
+
+def test_fast_medoid_matches_exact_when_unambiguous():
+    """On a hand-built cluster with a clear centre, fast and exact medoids agree."""
+    # B is central: closer to both A and C than they are to each other.
+    counts = {"YLLAGV": 10, "YMLAGV": 6, "YVLAGV": 6}
+    base = {a: "YLLAGV" for a in counts}
+    m_exact, _ = refine_clusters_py(counts, base, 0.6, 1, 0, False,
+                                    DEFAULT_AP, 2.0, False, 0)
+    m_fast, _ = refine_clusters_py(counts, base, 0.6, 1, 0, False,
+                                   DEFAULT_AP, 2.0, True, 0)
+    assert set(m_exact.values()) == set(m_fast.values())
+
+
+def test_cluster_fasta_fast_medoid_and_merge_cap(tmp_path):
+    stats = pepcluster.cluster_fasta(
+        str(EXAMPLE), str(tmp_path), threshold=0.6, refinement=True,
+        fast_medoid=True, merge_cap=16, verbose=False)
+    assert stats["n_clusters"] >= 1
+    assert (tmp_path / "clusters.tsv").exists()
+
+
 # ── Cluster representatives ────────────────────────────────────────────────
 
 def _brute_force_best_sigma(counts, mapping, tables):

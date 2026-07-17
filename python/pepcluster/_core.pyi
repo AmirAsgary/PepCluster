@@ -28,13 +28,18 @@ def refine_clusters(
     merge: bool = True,
     anchor_positions: Sequence[int] = ...,
     anchor_weight: float = 2.0,
+    fast_medoid: bool = False,
+    merge_cap: int = 0,
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     """Lloyd-style refinement of an existing clustering.
 
     ``cap`` bounds the centroid comparisons per anchor in the reassignment step
     (candidates examined own-block-first, largest-cluster-first; ``<= 0`` means
-    no cap). ``merge`` toggles the centroid-merge sub-step. ``anchor_positions``
-    / ``anchor_weight`` must match those used for clustering.
+    no cap). ``merge`` toggles the centroid-merge sub-step. ``fast_medoid`` uses
+    the O(N) medoid decomposition instead of the exact O(k^2) medoid.
+    ``merge_cap`` bounds candidate centroids examined per centroid in the merge
+    step (``<= 0`` = no cap). ``anchor_positions`` / ``anchor_weight`` must match
+    those used for clustering.
 
     Returns ``(refined_mapping, stats)``. ``stats`` has keys: ``passes``,
     ``medoid_changes``, ``reassignments``, ``merges``, ``initial_clusters``,
