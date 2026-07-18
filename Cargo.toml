@@ -1,6 +1,6 @@
 [package]
 name = "pepcluster"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Rust backend for BLOSUM62-aware anchor-residue clustering of immunopeptides"
 license = "MIT"

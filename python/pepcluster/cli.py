@@ -74,6 +74,26 @@ def main(argv=None):
                          "refinement merge step (default: 0 = no cap). A value "
                          "like 32 makes merge fast when there are many clusters "
                          "(e.g. high thresholds). Only used with --refinement")
+    ap.add_argument("--central-region-profiling", action="store_true",
+                    help="Build a central-region k-mer profile per cluster and "
+                         "(unless --no-cluster-profile-merge) merge clusters by "
+                         "a combined anchor + central-profile score. Needs "
+                         "--refinement to take effect")
+    ap.add_argument("--crr-kmer-size", type=int, default=2,
+                    help="Central-region k-mer length (default: 2)")
+    ap.add_argument("--crr-bins", type=int, default=3,
+                    help="Number of relative-position bins (default: 3)")
+    ap.add_argument("--crr-adjacent-bin-smoothing", type=float, default=0.5,
+                    help="Adjacent-bin smoothing weight (default: 0.5)")
+    ap.add_argument("--no-cluster-profile-merge", action="store_true",
+                    help="With --central-region-profiling, keep the anchor-only "
+                         "merge instead of the combined-score merge")
+    ap.add_argument("--cluster-profile-merge-weight", type=float, default=0.2,
+                    help="Weight of the central-profile term in the merge score "
+                         "(default: 0.2)")
+    ap.add_argument("--cluster-profile-merge-threshold", type=float, default=0.6,
+                    help="Combined-score threshold to merge two clusters "
+                         "(default: 0.6)")
     ap.add_argument("--threads", type=int, default=1,
                     help="Worker threads for the Rust backend's greedy "
                          "clustering and refinement (1 = serial, default; "
@@ -109,6 +129,13 @@ def main(argv=None):
             merge=not args.no_merge,
             fast_medoid=args.fast_medoid,
             merge_cap=args.merge_cap,
+            central_region_profiling=args.central_region_profiling,
+            crr_kmer_size=args.crr_kmer_size,
+            crr_bins=args.crr_bins,
+            crr_smoothing=args.crr_adjacent_bin_smoothing,
+            cluster_profile_merge=not args.no_cluster_profile_merge,
+            merge_weight=args.cluster_profile_merge_weight,
+            merge_threshold=args.cluster_profile_merge_threshold,
             threads=args.threads,
             backend=args.backend,
             verbose=not args.quiet,

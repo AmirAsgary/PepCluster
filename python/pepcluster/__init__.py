@@ -29,12 +29,16 @@ from .clustering import (
     build_tables,
     anchor_sim_fast,
     block_upper_bound,
+    middle_kmers,
+    build_cluster_profiles,
+    kmer_profile_similarity,
+    profile_aware_merge,
     DEFAULT_ANCHOR_SPEC,
     DEFAULT_ANCHOR_POSITIONS,
     DEFAULT_ANCHOR_WEIGHT,
 )
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # Prefer the compiled Rust backend; fall back to the pure-Python reference.
 try:
@@ -62,6 +66,10 @@ __all__ = [
     "build_tables",
     "anchor_sim_fast",
     "block_upper_bound",
+    "middle_kmers",
+    "build_cluster_profiles",
+    "kmer_profile_similarity",
+    "profile_aware_merge",
     "DEFAULT_ANCHOR_SPEC",
     "DEFAULT_ANCHOR_POSITIONS",
     "DEFAULT_ANCHOR_WEIGHT",

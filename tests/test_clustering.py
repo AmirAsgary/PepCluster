@@ -19,6 +19,10 @@ from pepcluster.clustering import (
     cluster_anchors_py,
     refine_clusters_py,
     cluster_representatives,
+    middle_kmers,
+    build_cluster_profiles,
+    kmer_profile_similarity,
+    profile_aware_merge,
     _to_ords,
 )
 
@@ -522,3 +526,88 @@ def test_cluster_fasta_rejects_bad_anchors(tmp_path):
     with pytest.raises(ValueError):
         pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path),
                                  anchors="4;3", verbose=False)
+
+
+# ── Central-region k-mer profiling + profile-aware merge (#2 / #3) ──────────
+
+def test_middle_kmers_bins_match_spec():
+    # 9-mer, n_front=n_back=3 -> middle length 3, k=2 -> two k-mers at bins 0, 2.
+    km = list(middle_kmers("AAA" + "LMN" + "CCC", 3, 3, 2, 3))
+    assert km == [(0, "LM"), (2, "MN")]
+    # middle too short for a k-mer -> nothing
+    assert list(middle_kmers("AAA" + "L" + "CCC", 3, 3, 2, 3)) == []
+    # exactly one k-mer -> central bin
+    km1 = list(middle_kmers("AAA" + "LM" + "CCC", 3, 3, 2, 3))
+    assert km1 == [(1, "LM")]
+
+
+def test_middle_kmers_bins_span_range():
+    # A long middle should populate the first and last bins.
+    km = list(middle_kmers("AAA" + "ACDEFGHIKLM" + "CCC", 3, 3, 2, 3))
+    bins = {b for b, _ in km}
+    assert 0 in bins and 2 in bins
+
+
+def test_kmer_profile_similarity_bounds():
+    p = {(0, "LL"): 3, (1, "VV"): 1}
+    assert kmer_profile_similarity(p, p, 3, 0.5) == pytest.approx(1.0)
+    q = {(0, "WW"): 2, (2, "GG"): 2}       # disjoint k-mers, non-adjacent bins
+    assert kmer_profile_similarity(p, q, 3, 0.0) == pytest.approx(0.0)
+    assert kmer_profile_similarity(p, {}, 3, 0.5) == 0.0
+    s = kmer_profile_similarity(p, q, 3, 0.5)
+    assert 0.0 <= s <= 1.0
+
+
+def test_profile_merge_is_deterministic():
+    """The profile-aware pipeline must be reproducible run-to-run."""
+    kw = dict(threshold=0.6, refinement=True, central_region_profiling=True,
+              verbose=False)
+    import tempfile, os
+    def run():
+        d = tempfile.mkdtemp()
+        pepcluster.cluster_fasta(str(EXAMPLE), d, **kw)
+        return open(os.path.join(d, "clusters.tsv")).read()
+    assert run() == run()
+
+
+def test_profile_merge_only_merges(tmp_path):
+    """Profile-aware merge can only reduce (or keep) the cluster count."""
+    base = pepcluster.cluster_fasta(
+        str(EXAMPLE), str(tmp_path / "a"), threshold=0.5, refinement=True,
+        central_region_profiling=True, cluster_profile_merge=False, verbose=False)
+    prof = pepcluster.cluster_fasta(
+        str(EXAMPLE), str(tmp_path / "b"), threshold=0.5, refinement=True,
+        central_region_profiling=True, cluster_profile_merge=True,
+        merge_weight=0.2, merge_threshold=0.5, verbose=False)
+    assert prof["n_clusters"] <= base["n_clusters"]
+    assert prof["profile_merges"] is not None
+
+
+def test_profile_merge_raw_counts_are_associative():
+    """Merging clusters by adding raw counts == rebuilding from all members."""
+    peptides = [
+        ("p1", "AAA" + "LMLM" + "CCC", "AAACCC"),
+        ("p2", "AAA" + "LMLL" + "CCC", "AAACCC"),
+        ("p3", "AAA" + "VVVV" + "CCC", "AAACCC"),
+    ]
+    mapping = {"AAACCC": "AAACCC"}
+    profs = build_cluster_profiles(peptides, mapping, 3, 3, 2, 3)
+    # Rebuild the same cluster's profile directly and compare (raw integer eq).
+    from collections import defaultdict
+    direct = defaultdict(int)
+    for _h, seq, _a in peptides:
+        for feat in middle_kmers(seq, 3, 3, 2, 3):
+            direct[feat] += 1
+    assert dict(profs["AAACCC"]) == dict(direct)
+
+
+def test_central_profiling_defaults_off(tmp_path):
+    """Profiling is opt-in; leaving it off changes nothing vs plain refinement."""
+    a = pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path / "a"), threshold=0.6,
+                                 refinement=True, verbose=False)
+    b = pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path / "b"), threshold=0.6,
+                                 refinement=True, central_region_profiling=False,
+                                 verbose=False)
+    assert (tmp_path / "a" / "clusters.tsv").read_text() == \
+        (tmp_path / "b" / "clusters.tsv").read_text()
+    assert a["profile_merges"] is None

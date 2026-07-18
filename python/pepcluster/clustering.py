@@ -95,6 +95,13 @@ DEFAULT_N_FRONT = 3
 DEFAULT_N_BACK = 3
 DEFAULT_ANCHOR_POSITIONS = (1, 5)
 DEFAULT_ANCHOR_WEIGHT = 2.0
+
+# Central-region k-mer profiling defaults (improvements #2 / #3).
+DEFAULT_CRR_KMER_SIZE = 2
+DEFAULT_CRR_BINS = 3
+DEFAULT_CRR_SMOOTHING = 0.5
+DEFAULT_MERGE_WEIGHT = 0.2
+DEFAULT_MERGE_THRESHOLD = 0.6
 DEFAULT_ANCHOR_SPEC = "2;3"
 
 # At most 8 anchor positions, so a block key packs into one byte each.
@@ -839,6 +846,186 @@ def cluster_representatives(anchor_counts, mapping,
 
 
 # ============================================================================
+# Central-region k-mer profiling + profile-aware merging (improvements #2/#3)
+# ============================================================================
+
+def middle_kmers(seq, n_front, n_back, k, bins):
+    """
+    Position-binned k-mers of a peptide's central region.
+
+    The middle region is ``seq[n_front : len(seq) - n_back]`` — the part not
+    pulled into the anchor. Overlapping k-mers are assigned to one of ``bins``
+    relative-position bins by a purely integer formula, so bin assignment is
+    identical everywhere:
+
+        n = number of k-mers = len(middle) - k + 1
+        bin(i) = (2*i*(bins-1) + (n-1)) // (2*(n-1))   for n > 1     (i = 0..n-1)
+        bin    = (bins - 1) // 2                        for n == 1   (central bin)
+
+    Peptides whose middle is shorter than ``k`` (n < 1) yield nothing.
+
+    Yields ``(bin, kmer)`` tuples.
+    """
+    mid_len = len(seq) - n_front - n_back
+    if mid_len < k:
+        return
+    mid = seq[n_front:len(seq) - n_back]
+    n = mid_len - k + 1
+    if n == 1:
+        yield ((bins - 1) // 2, mid[0:k])
+        return
+    denom = 2 * (n - 1)
+    for i in range(n):
+        b = (2 * i * (bins - 1) + (n - 1)) // denom
+        yield (b, mid[i:i + k])
+
+
+def build_cluster_profiles(peptides, mapping, n_front, n_back, k, bins):
+    """
+    Build one raw (integer-count) central-region profile per cluster.
+
+    ``peptides`` is an iterable of ``(header, sequence, anchor)``; each peptide
+    contributes its central k-mers (weighted by occurrence = 1 per peptide) to
+    the profile of its cluster ``mapping[anchor]``.
+
+    Returns ``dict[centroid, dict[(bin, kmer), count]]`` (raw integer counts).
+    """
+    profiles = defaultdict(lambda: defaultdict(int))
+    for _hdr, seq, anc in peptides:
+        centroid = mapping[anc]
+        prof = profiles[centroid]
+        for feat in middle_kmers(seq, n_front, n_back, k, bins):
+            prof[feat] += 1
+    return profiles
+
+
+def _smoothed_normalized(raw, bins, alpha):
+    """Normalize a raw integer profile, apply adjacent-bin smoothing
+    ``f̃(b,k) = f(b,k) + α·f(b-1,k) + α·f(b+1,k)`` (zero outside range), then
+    renormalize. Returns a dict ``(bin, kmer) -> weight`` summing to ~1."""
+    total = sum(raw.values())
+    if total == 0:
+        return {}
+    smoothed = defaultdict(float)
+    for (b, kmer), cnt in sorted(raw.items()):
+        f = cnt / total
+        smoothed[(b, kmer)] += f
+        if b - 1 >= 0:
+            smoothed[(b - 1, kmer)] += alpha * f
+        if b + 1 < bins:
+            smoothed[(b + 1, kmer)] += alpha * f
+    s = sum(smoothed.values())
+    if s == 0:
+        return {}
+    return {feat: v / s for feat, v in smoothed.items()}
+
+
+def kmer_profile_similarity(raw1, raw2, bins, alpha):
+    """Weighted-Jaccard similarity of two clusters' central profiles, after
+    normalization + adjacent-bin smoothing + renormalization. In [0, 1]; 0 if
+    either profile is empty."""
+    if not raw1 or not raw2:
+        return 0.0
+    f1 = _smoothed_normalized(raw1, bins, alpha)
+    f2 = _smoothed_normalized(raw2, bins, alpha)
+    if not f1 or not f2:
+        return 0.0
+    num = 0.0
+    den = 0.0
+    for feat in sorted(set(f1) | set(f2)):      # sorted -> reproducible sum
+        a = f1.get(feat, 0.0)
+        b = f2.get(feat, 0.0)
+        num += a if a < b else b                # min
+        den += a if a > b else b                # max
+    return num / den if den > 0.0 else 0.0
+
+
+def profile_aware_merge(mapping, anchor_counts, profiles, tables,
+                        w_merge=DEFAULT_MERGE_WEIGHT,
+                        t_merge=DEFAULT_MERGE_THRESHOLD, merge_cap=0,
+                        bins=DEFAULT_CRR_BINS, alpha=DEFAULT_CRR_SMOOTHING):
+    """
+    Agglomerative cluster merge using a combined score:
+
+        S_merge = (1 - w_merge)·S_anchor(centroid1, centroid2)
+                  + w_merge·S_kmer(profile1, profile2)
+
+    Centroids are processed largest-first; a *smaller* neighbouring centroid is
+    absorbed into a larger one when ``S_merge >= t_merge``. Raw profiles are
+    combined by integer addition as clusters merge (so the result is exactly a
+    rebuild from members). Reuses the coarse-block neighbour structure and the
+    ``merge_cap`` bound.
+
+    Returns ``(new_mapping, n_merges)``.
+    """
+    n_ap = len(tables.anchor_positions)
+    str_to_ords = {c: _to_ords(c) for c in set(mapping.values())}
+
+    members = defaultdict(list)
+    for a, c in mapping.items():
+        members[c].append(a)
+    cluster_freq = {c: sum(anchor_counts[m] for m in mems)
+                    for c, mems in members.items()}
+    # Mutable working copies (profiles grow as clusters absorb others).
+    prof = {c: dict(profiles.get(c, {})) for c in cluster_freq}
+
+    sorted_cents = sorted(cluster_freq, key=lambda c: (-cluster_freq[c], c))
+    centroids_in_block = defaultdict(list)
+    block_of = {}
+    for c in sorted_cents:
+        bk = block_key_fast(str_to_ords[c], tables)
+        centroids_in_block[bk].append(c)
+        block_of[c] = bk
+    sorted_blocks = sorted(centroids_in_block)
+    neighbours_of = {bk: [bk] + [b for b in sorted_blocks
+                                 if b != bk and _is_neighbour(bk, b, n_ap)]
+                     for bk in centroids_in_block}
+
+    merge_map = {}
+    absorbed = set()
+    for c1 in sorted_cents:
+        if c1 in absorbed:
+            continue
+        examined = 0
+        stop = False
+        for bk2 in neighbours_of[block_of[c1]]:
+            if stop:
+                break
+            for c2 in centroids_in_block.get(bk2, ()):
+                if c2 == c1:
+                    continue
+                if merge_cap > 0 and examined >= merge_cap:
+                    stop = True
+                    break
+                examined += 1
+                if c2 in absorbed:
+                    continue
+                if cluster_freq[c2] >= cluster_freq[c1]:
+                    continue  # only smaller absorbed into larger
+                s_anchor = anchor_sim_fast(str_to_ords[c1], str_to_ords[c2],
+                                           -1.0, tables)
+                s_kmer = kmer_profile_similarity(prof.get(c1, {}),
+                                                 prof.get(c2, {}), bins, alpha)
+                s_merge = (1.0 - w_merge) * s_anchor + w_merge * s_kmer
+                if s_merge >= t_merge:
+                    merge_map[c2] = c1
+                    absorbed.add(c2)
+                    # absorb raw counts + frequency into c1
+                    p1 = prof.setdefault(c1, {})
+                    for feat, cnt in prof.get(c2, {}).items():
+                        p1[feat] = p1.get(feat, 0) + cnt
+                    cluster_freq[c1] += cluster_freq[c2]
+
+    if merge_map:
+        def resolve(c):
+            while c in merge_map:
+                c = merge_map[c]
+            return c
+        mapping = {a: resolve(c) for a, c in mapping.items()}
+    return mapping, len(merge_map)
+
+
+# ============================================================================
 # Backend resolution
 # ============================================================================
 
@@ -871,6 +1058,12 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                   obg_min_block_upper_bound=0.0,
                   refinement=False, iterations=3,
                   refine_cap=32, merge=True, fast_medoid=False, merge_cap=0,
+                  central_region_profiling=False,
+                  crr_kmer_size=DEFAULT_CRR_KMER_SIZE, crr_bins=DEFAULT_CRR_BINS,
+                  crr_smoothing=DEFAULT_CRR_SMOOTHING,
+                  cluster_profile_merge=True,
+                  merge_weight=DEFAULT_MERGE_WEIGHT,
+                  merge_threshold=DEFAULT_MERGE_THRESHOLD,
                   threads=1, backend="auto", verbose=True):
     """
     Run the full anchor-clustering pipeline on a FASTA file.
@@ -914,6 +1107,19 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                           merge step (default 0 = no cap; a positive value such
                           as 32 makes merge fast when there are many clusters,
                           e.g. high thresholds)
+        central_region_profiling: build a central-region k-mer profile per
+                          cluster and, unless cluster_profile_merge=False, merge
+                          clusters by a combined anchor + central-profile score
+                          instead of the anchor-only merge (default False;
+                          requires refinement=True to have an effect)
+        crr_kmer_size:    central-region k-mer length (default 2)
+        crr_bins:         number of relative-position bins (default 3)
+        crr_smoothing:    adjacent-bin smoothing weight α (default 0.5)
+        cluster_profile_merge: when profiling, use the combined-score merge
+                          (default True; False falls back to anchor-only merge)
+        merge_weight:     weight of the central-profile term in the merge score
+                          (default 0.2)
+        merge_threshold:  combined-score threshold to merge (default 0.6)
         threads:          worker threads for the Rust backend's greedy clustering
                           and refinement reassignment/medoid steps (default 1 =
                           serial; 0 = all cores; N = exactly N). Bit-identical to
@@ -993,15 +1199,21 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
     log(f"      {n_early:>12,}  early-terminated ({early_pct:.1f}%)")
 
     # ── Step 2.5: optional refinement ─────────────────────────────────
+    # When central-profile merging is used, the anchor-only merge step inside
+    # refinement is replaced by the combined-score merge pass below.
+    use_profile_merge = (central_region_profiling and refinement
+                         and cluster_profile_merge)
     refine_stats = None
+    n_profile_merges = None
     if refinement:
+        eff_merge = merge and not use_profile_merge
         log(f"\n[2.5/4] Refining clusters (max {iterations} passes, "
-            f"cap {refine_cap}, merge {'on' if merge else 'off'}"
-            f"{f' (cap {merge_cap})' if merge and merge_cap > 0 else ''}, "
+            f"cap {refine_cap}, merge {'on' if eff_merge else 'off'}"
+            f"{f' (cap {merge_cap})' if eff_merge and merge_cap > 0 else ''}, "
             f"medoid {'fast' if fast_medoid else 'exact'}, "
             f"backend: {backend_name}) …", flush=True)
         mapping, refine_stats = refine_fn(
-            dict(acounts), mapping, threshold, iterations, refine_cap, merge,
+            dict(acounts), mapping, threshold, iterations, refine_cap, eff_merge,
             anchor_positions, anchor_weight, fast_medoid, merge_cap, threads)
         log(f"      passes run:      {refine_stats['passes']}")
         log(f"      medoid changes:  {refine_stats['medoid_changes']:,}")
@@ -1010,6 +1222,22 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         log(f"      clusters: {refine_stats['initial_clusters']:,} "
             f"→ {refine_stats['final_clusters']:,}")
         n_clusters = refine_stats["final_clusters"]
+
+    # ── Step 2.6: optional central-region profile-aware merging ───────
+    if use_profile_merge:
+        log(f"\n[2.6/4] Central-region profile merge (k={crr_kmer_size}, "
+            f"bins={crr_bins}, smoothing={crr_smoothing}, weight={merge_weight}, "
+            f"threshold={merge_threshold}) …", flush=True)
+        ptables = build_tables(alen, anchor_positions, anchor_weight)
+        profiles = build_cluster_profiles(peptides, mapping, n_front, n_back,
+                                          crr_kmer_size, crr_bins)
+        before = len(set(mapping.values()))
+        mapping, n_profile_merges = profile_aware_merge(
+            mapping, dict(acounts), profiles, ptables, merge_weight,
+            merge_threshold, merge_cap, crr_bins, crr_smoothing)
+        n_clusters = len(set(mapping.values()))
+        log(f"      profile merges:  {n_profile_merges:,}")
+        log(f"      clusters: {before:,} → {n_clusters:,}")
 
     # ── Step 3: assign peptides → clusters + pick representatives ──────
     log("\n[3/4] Assigning peptides and finding representatives …", flush=True)
@@ -1117,6 +1345,18 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
             "",
         ]
 
+    if n_profile_merges is not None:
+        report += [
+            "  Central-region profile merge:  ENABLED",
+            f"    K-mer size:        {crr_kmer_size}",
+            f"    Position bins:     {crr_bins}",
+            f"    Bin smoothing a:   {crr_smoothing}",
+            f"    Profile weight:    {merge_weight}",
+            f"    Merge threshold:   {merge_threshold}",
+            f"    Profile merges:    {n_profile_merges:,}",
+            "",
+        ]
+
     report += [
         "  Cluster size distribution:",
         f"    singletons:        {sum(1 for s in sizes if s == 1):,}",
@@ -1159,6 +1399,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         "comparisons":      n_cmp,
         "early_terminated": n_early,
         "refinement":       refine_stats,
+        "profile_merges":   n_profile_merges,
         "elapsed_sec":      elapsed,
     }
     return stats
