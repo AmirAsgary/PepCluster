@@ -28,12 +28,13 @@ from .clustering import (
     parse_anchors,
     build_tables,
     anchor_sim_fast,
+    block_upper_bound,
     DEFAULT_ANCHOR_SPEC,
     DEFAULT_ANCHOR_POSITIONS,
     DEFAULT_ANCHOR_WEIGHT,
 )
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # Prefer the compiled Rust backend; fall back to the pure-Python reference.
 try:
@@ -60,6 +61,7 @@ __all__ = [
     "parse_anchors",
     "build_tables",
     "anchor_sim_fast",
+    "block_upper_bound",
     "DEFAULT_ANCHOR_SPEC",
     "DEFAULT_ANCHOR_POSITIONS",
     "DEFAULT_ANCHOR_WEIGHT",

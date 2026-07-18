@@ -14,6 +14,8 @@ from pepcluster.clustering import (
     extract_anchor,
     anchor_sim_fast,
     build_tables,
+    block_upper_bound,
+    block_key_fast,
     cluster_anchors_py,
     refine_clusters_py,
     cluster_representatives,
@@ -109,6 +111,102 @@ def test_rust_python_cluster_parity():
     py_map, _, _ = cluster_anchors_py(counts, THRESHOLD)
     rs_map, _, _ = pepcluster.cluster_anchors(counts, THRESHOLD)
     assert rs_map == py_map
+
+
+# ── OBG multi-probe block search (Improvement 1) ───────────────────────────
+
+def test_block_upper_bound_is_admissible():
+    """The block bound must be >= the true similarity of any anchor pair whose
+    anchor residues fall in those blocks (so it never prunes a real match)."""
+    tables = build_tables(6, DEFAULT_AP, 2.0)
+    counts = _random_counts(400, seed=3)
+    anchors = list(counts)
+    keys = {a: block_key_fast(_to_ords(a), tables) for a in anchors}
+    import random
+    rng = random.Random(0)
+    for _ in range(3000):
+        a = rng.choice(anchors)
+        b = rng.choice(anchors)
+        ub = block_upper_bound(keys[a], keys[b], tables)
+        s = anchor_sim_fast(_to_ords(a), _to_ords(b), -1.0, tables)
+        assert s <= ub + 1e-12            # admissible
+    # Same block -> bound is exactly 1 (identical anchors are possible).
+    assert block_upper_bound(keys[anchors[0]], keys[anchors[0]], tables) == \
+        pytest.approx(1.0)
+
+
+def test_obg_default_off_matches_plain_greedy():
+    """OBG disabled must reproduce the ordinary same-block greedy exactly."""
+    counts = _random_counts(2000, seed=1)
+    for thr in (0.3, 0.6, 0.8):
+        base, _, _ = cluster_anchors_py(counts, thr)
+        off, _, _ = cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0,
+                                       obg_block_search=False)
+        assert base == off
+
+
+def test_obg_never_increases_cluster_count():
+    """Searching neighbouring blocks can only merge, never split, clusters."""
+    counts = _random_counts(3000, seed=2)
+    for thr in (0.3, 0.5, 0.7):
+        base, _, _ = cluster_anchors_py(counts, thr)
+        obg, _, _ = cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0,
+                                       obg_block_search=True)
+        assert len(set(obg.values())) <= len(set(base.values()))
+
+
+def test_obg_max_probes_between_off_and_unlimited():
+    """A probe cap gives a cluster count between same-block and full OBG."""
+    counts = _random_counts(3000, seed=5)
+    thr = 0.5
+    off = len(set(cluster_anchors_py(counts, thr)[0].values()))
+    full = len(set(cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0, True)[0].values()))
+    capped = len(set(cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0, True, 2)[0].values()))
+    assert full <= capped <= off
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("thr", [0.3, 0.5, 0.7])
+@pytest.mark.parametrize("max_probes,min_ub", [(0, 0.0), (3, 0.0), (0, 0.7)])
+def test_rust_python_obg_parity(thr, max_probes, min_ub):
+    counts = _random_counts(3000, seed=4)
+    py_map, py_c, py_e = cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0,
+                                            True, max_probes, min_ub)
+    rs_map, rs_c, rs_e = pepcluster.cluster_anchors(counts, thr, DEFAULT_AP, 2.0,
+                                                    True, max_probes, min_ub)
+    assert rs_map == py_map
+    assert (rs_c, rs_e) == (py_c, py_e)
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("alen,ap", [(6, [1, 5]), (4, [1, 3]), (8, [1, 7]),
+                                     (6, [1, 4, 5])])
+def test_rust_python_obg_parity_custom_anchors(alen, ap):
+    counts = _random_counts(2000, seed=6, alen=alen)
+    py_map, _, _ = cluster_anchors_py(counts, 0.4, ap, 2.0, True, 0, 0.0)
+    rs_map, _, _ = pepcluster.cluster_anchors(counts, 0.4, ap, 2.0, True, 0, 0.0)
+    assert rs_map == py_map
+
+
+def test_obg_merges_a_split_pair():
+    """Two anchors similar overall but split across blocks by the coarse
+    alphabet: OBG puts them together, plain greedy does not."""
+    # 'K' (group KR) vs 'R' (group KR) are same group -> use P2 across groups.
+    # Build two anchors identical except P2 in different coarse groups that are
+    # still BLOSUM-similar enough to pass a modest threshold overall.
+    a = "ALAAAA"   # P2 = L (group VILM)
+    b = "AIAAAA"   # P2 = I (group VILM) -> same block; not a split. skip.
+    # I/M are same group; use L (VILM) vs F (FYW): different blocks, modest sim.
+    a = "ALAAAA"   # P2 L -> VILM
+    b = "AFAAAA"   # P2 F -> FYW  (different block)
+    counts = {a: 5, b: 1}
+    tables = build_tables(6, DEFAULT_AP, 2.0)
+    s = anchor_sim_fast(_to_ords(a), _to_ords(b), -1.0, tables)
+    thr = s - 0.01  # threshold just below their similarity
+    plain, _, _ = cluster_anchors_py(counts, thr)
+    obg, _, _ = cluster_anchors_py(counts, thr, DEFAULT_AP, 2.0, True)
+    assert len(set(plain.values())) == 2      # split
+    assert len(set(obg.values())) == 1        # merged by OBG
 
 
 @pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")

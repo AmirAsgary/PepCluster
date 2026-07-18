@@ -75,6 +75,14 @@ struct SimTables {
     coarse: [u8; 128],
     /// Anchor positions (sorted, deduped) — weighted up and used for blocking.
     anchor_positions: Vec<usize>,
+    /// Normalized per-position weight (sums to 1 over all positions).
+    weights: Vec<f64>,
+    /// maxgroupsim[g1][g2] = max normalized BLOSUM62 similarity between any
+    /// residue of coarse group g1 and any residue of coarse group g2. Used to
+    /// upper-bound the similarity achievable between two blocks (OBG search).
+    maxgroupsim: [[f64; 10]; 10],
+    /// Σ of normalized weights over the anchor positions (the blocked ones).
+    anchor_wsum: f64,
 }
 
 impl SimTables {
@@ -144,6 +152,29 @@ impl SimTables {
             }
         }
 
+        // Max normalized similarity between any residues of two coarse groups.
+        // The diagonal is 1.0 (a group can pair a residue with itself).
+        let mut maxgroupsim = [[0.0f64; 10]; 10];
+        for (g1, &grp1) in COARSE_GROUPS.iter().enumerate() {
+            for (g2, &grp2) in COARSE_GROUPS.iter().enumerate() {
+                // Start at -inf, not 0: some group pairs have a negative maximum
+                // similarity, and clamping to 0 would inflate the bound (and
+                // diverge from the Python backend's plain max()).
+                let mut m = f64::NEG_INFINITY;
+                for &x in grp1 {
+                    let xi = aa_idx[x as usize] as usize;
+                    for &y in grp2 {
+                        let yi = aa_idx[y as usize] as usize;
+                        if norm_sim[xi][yi] > m { m = norm_sim[xi][yi]; }
+                    }
+                }
+                maxgroupsim[g1][g2] = m;
+            }
+        }
+
+        let weights: Vec<f64> = (0..alen).map(|p| raw[p] / wsum).collect();
+        let anchor_wsum: f64 = anchor_positions.iter().map(|&p| weights[p]).sum();
+
         SimTables {
             alen,
             check_pos,
@@ -151,7 +182,38 @@ impl SimTables {
             remaining_after,
             coarse,
             anchor_positions: anchor_positions.to_vec(),
+            weights,
+            maxgroupsim,
+            anchor_wsum,
         }
+    }
+
+    /// Max similarity between coarse groups g1 and g2. Same group (or any
+    /// unknown residue, coded 255) can reach the identity maximum of 1.0.
+    #[inline]
+    fn maxgroupsim_of(&self, g1: u8, g2: u8) -> f64 {
+        if g1 == g2 || g1 >= 10 || g2 >= 10 {
+            1.0
+        } else {
+            self.maxgroupsim[g1 as usize][g2 as usize]
+        }
+    }
+
+    /// Upper bound on the anchor similarity achievable between any anchor in
+    /// block `k1` and any anchor in block `k2`. Non-anchor positions are
+    /// unconstrained by the block key, so they contribute their full weight
+    /// (max similarity 1). Admissible: never below the true achievable maximum.
+    #[inline]
+    fn block_upper_bound(&self, k1: u64, k2: u64) -> f64 {
+        let m = self.anchor_positions.len();
+        let mut ub = 1.0 - self.anchor_wsum; // all non-anchor positions at max
+        for (i, &p) in self.anchor_positions.iter().enumerate() {
+            let sh = 8 * (m - 1 - i);
+            let g1 = ((k1 >> sh) & 0xFF) as u8;
+            let g2 = ((k2 >> sh) & 0xFF) as u8;
+            ub += self.weights[p] * self.maxgroupsim_of(g1, g2);
+        }
+        ub
     }
 
     /// Weighted BLOSUM62-normalized similarity with early termination.
@@ -358,17 +420,28 @@ fn parse_anchor_counts(
 ///     anchor_positions: list[int] — 0-based positions within the anchor that
 ///                       are binding anchors (weighted up + used for blocking)
 ///     anchor_weight:    float — weight of anchor positions (others are 1.0)
+///     obg_block_search: bool — search neighbouring blocks whose upper bound is
+///                       at least the threshold, not just the anchor's own block
+///     obg_max_probes:   int — max blocks searched per anchor (incl. own block);
+///                       <= 0 means unlimited
+///     obg_min_block_upper_bound: float — only search blocks whose upper bound
+///                       is at least this (the effective cut is
+///                       max(threshold, this))
 ///
 /// Returns:
 ///     (mapping, n_comparisons, n_early_exits)
 #[pyfunction]
-#[pyo3(signature = (anchor_counts, threshold, anchor_positions=vec![1, 5], anchor_weight=2.0))]
+#[pyo3(signature = (anchor_counts, threshold, anchor_positions=vec![1, 5], anchor_weight=2.0,
+                    obg_block_search=false, obg_max_probes=0, obg_min_block_upper_bound=0.0))]
 fn cluster_anchors(
     py: Python<'_>,
     anchor_counts: &Bound<'_, PyDict>,
     threshold: f64,
     anchor_positions: Vec<usize>,
     anchor_weight: f64,
+    obg_block_search: bool,
+    obg_max_probes: i64,
+    obg_min_block_upper_bound: f64,
 ) -> PyResult<(PyObject, u64, u64)> {
     let (names_in, flat_in, counts_in, alen) = parse_anchor_counts(anchor_counts)?;
     if names_in.is_empty() {
@@ -376,6 +449,7 @@ fn cluster_anchors(
     }
     let ap = check_positions(&anchor_positions, alen)?;
     let tables = SimTables::new(alen, &ap, anchor_weight);
+    let cutoff = threshold.max(obg_min_block_upper_bound);
 
     // Sort by frequency descending (stable: ties keep dict insertion order,
     // matching the Python backend).
@@ -390,42 +464,72 @@ fn cluster_anchors(
         flat.extend_from_slice(arow(&flat_in, oi, alen));
     }
 
-    // Partition into blocks by the coarse alphabet at the anchor positions.
-    let mut blocks: HashMap<u64, Vec<usize>> = HashMap::new();
-    for i in 0..n {
-        let bk = tables.block_key(arow(&flat, i, alen));
-        blocks.entry(bk).or_default().push(i);
-    }
-
-    // Greedy centroid clustering within each block
+    // Greedy centroid clustering. Anchors are processed most-frequent-first;
+    // each joins the first centroid at or above `threshold`, else becomes a new
+    // centroid. Centroids are indexed by block key. When OBG search is on, an
+    // anchor also considers centroids in neighbouring blocks whose upper bound
+    // reaches the threshold, ranked by upper bound (own block always first).
+    let mut centroids_by_block: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut centroid_of: Vec<usize> = vec![0; n];
     let mut n_cmp: u64 = 0;
     let mut n_early: u64 = 0;
 
-    for (_, members) in blocks.iter() {
-        let mut centroids: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let ki = tables.block_key(arow(&flat, i, alen));
 
-        for &idx in members.iter() {
-            let anchor = arow(&flat, idx, alen);
-            let mut matched = false;
-
-            for &ci in centroids.iter() {
-                n_cmp += 1;
-                let score = tables.anchor_sim(anchor, arow(&flat, ci, alen), threshold);
-                if score < 0.0 {
-                    n_early += 1;
-                    continue;
-                }
-                if score >= threshold {
-                    centroid_of[idx] = ci;
-                    matched = true;
-                    break;
+        // Neighbour blocks to probe, beyond the anchor's own block.
+        let mut probe_blocks: Vec<u64> = Vec::new();
+        if obg_block_search {
+            let mut cand: Vec<(f64, u64)> = Vec::new();
+            for &kb in centroids_by_block.keys() {
+                if kb == ki { continue; }
+                let ub = tables.block_upper_bound(ki, kb);
+                if ub >= cutoff {
+                    cand.push((ub, kb));
                 }
             }
+            // Highest upper bound first; ties by block key for determinism.
+            cand.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1))
+            });
+            if obg_max_probes > 0 {
+                // Own block counts as one probe.
+                let keep = (obg_max_probes - 1).max(0) as usize;
+                cand.truncate(keep);
+            }
+            probe_blocks.extend(cand.into_iter().map(|(_, kb)| kb));
+        }
 
-            if !matched {
-                centroids.push(idx);
-                centroid_of[idx] = idx;
+        // Search own block first, then the ranked neighbour blocks.
+        let mut matched: Option<usize> = None;
+        if let Some(cs) = centroids_by_block.get(&ki) {
+            for &ci in cs.iter() {
+                n_cmp += 1;
+                let s = tables.anchor_sim(
+                    arow(&flat, i, alen), arow(&flat, ci, alen), threshold);
+                if s < 0.0 { n_early += 1; continue; }
+                if s >= threshold { matched = Some(ci); break; }
+            }
+        }
+        if matched.is_none() {
+            'nb: for &kb in probe_blocks.iter() {
+                if let Some(cs) = centroids_by_block.get(&kb) {
+                    for &ci in cs.iter() {
+                        n_cmp += 1;
+                        let s = tables.anchor_sim(
+                            arow(&flat, i, alen), arow(&flat, ci, alen), threshold);
+                        if s < 0.0 { n_early += 1; continue; }
+                        if s >= threshold { matched = Some(ci); break 'nb; }
+                    }
+                }
+            }
+        }
+
+        match matched {
+            Some(ci) => centroid_of[i] = ci,
+            None => {
+                centroids_by_block.entry(ki).or_default().push(i);
+                centroid_of[i] = i;
             }
         }
     }

@@ -7,12 +7,22 @@ def cluster_anchors(
     threshold: float,
     anchor_positions: Sequence[int] = ...,
     anchor_weight: float = 2.0,
+    obg_block_search: bool = False,
+    obg_max_probes: int = 0,
+    obg_min_block_upper_bound: float = 0.0,
 ) -> Tuple[Dict[str, str], int, int]:
     """Greedy centroid clustering of unique anchors.
 
     ``anchor_positions`` are 0-based positions within the anchor that count as
     binding anchors: they carry ``anchor_weight`` in the similarity and define
     the coarse-alphabet blocking (default ``[1, 5]`` = P2 and PΩ of a 6-mer).
+
+    ``obg_block_search`` enables Upper-Bound-Guided multi-probe search: each
+    anchor also considers centroids in neighbouring blocks whose upper bound
+    reaches the threshold (ranked by bound, own block first). ``obg_max_probes``
+    caps blocks searched per anchor (incl. own; ``<=0`` = all).
+    ``obg_min_block_upper_bound`` raises the eligibility cut to
+    ``max(threshold, this)``.
 
     Returns ``(mapping, n_comparisons, n_early_exits)`` where ``mapping`` maps
     each anchor to its centroid anchor.

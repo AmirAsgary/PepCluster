@@ -37,6 +37,20 @@ def main(argv=None):
     ap.add_argument("--anchor-weight", type=float, default=2.0,
                     help="Weight given to anchor positions; all other "
                          "positions have weight 1.0 (default: 2.0)")
+    ap.add_argument("--obg-block-search", action="store_true",
+                    help="Upper-Bound-Guided multi-probe block search: also "
+                         "compare each anchor against centroids in neighbouring "
+                         "blocks whose upper bound reaches the threshold, not "
+                         "just its own block. Gives fewer, tighter clusters at "
+                         "some extra cost (default: off = same-block only)")
+    ap.add_argument("--obg-max-probes", type=int, default=0,
+                    help="With --obg-block-search, search at most this many "
+                         "blocks per anchor (including its own block); "
+                         "0 = unlimited (default: 0)")
+    ap.add_argument("--obg-min-block-upper-bound", type=float, default=0.0,
+                    help="With --obg-block-search, only search blocks whose "
+                         "upper bound is at least this; the effective cut is "
+                         "max(threshold, this) (default: 0.0)")
     ap.add_argument("--refinement", action="store_true",
                     help="Apply Lloyd-style refinement after greedy "
                          "clustering (off by default)")
@@ -80,6 +94,9 @@ def main(argv=None):
             n_back=args.n_back,
             anchors=args.anchors,
             anchor_weight=args.anchor_weight,
+            obg_block_search=args.obg_block_search,
+            obg_max_probes=args.obg_max_probes,
+            obg_min_block_upper_bound=args.obg_min_block_upper_bound,
             refinement=args.refinement,
             iterations=args.iterations,
             refine_cap=args.refine_cap,

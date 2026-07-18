@@ -77,6 +77,9 @@ fall back to identical pure-Python implementations otherwise).
 | `--n-back` | `3` | C-terminal anchor length |
 | `--anchors` | `"2;3"` | Which positions are binding anchors, as `FRONT;BACK` (1-based per side). See [Choosing the anchors](#choosing-the-anchors) |
 | `--anchor-weight` | `2.0` | Weight given to anchor positions (all others are `1.0`) |
+| `--obg-block-search` | off | Also compare each anchor against centroids in neighbouring blocks whose upper bound reaches the threshold (fewer, tighter clusters) |
+| `--obg-max-probes` | `0` | With `--obg-block-search`, max blocks searched per anchor incl. own (`0` = all) |
+| `--obg-min-block-upper-bound` | `0.0` | With `--obg-block-search`, only search blocks with upper bound ≥ this (effective cut `max(threshold, this)`) |
 | `--refinement` | off | Apply Lloyd-style refinement after greedy clustering |
 | `--iterations` | `3` | Max refinement passes (with `--refinement`) |
 | `--refine-cap` | `32` | Max centroid comparisons per anchor in refinement reassignment (`<=0` = no cap). Lower = faster |
@@ -159,6 +162,31 @@ pepcluster -i peptides.fasta -o out --n-front 2 --n-back 2 --anchors "2;2"
 ```
 
 Up to 8 anchor positions are supported (they form the blocking key).
+
+---
+
+## Tighter clusters: upper-bound-guided block search
+
+For speed, the greedy pass only compares anchors that share a coarse-alphabet
+block at the anchor positions. This can *over-split*: two anchors that are
+genuinely similar overall but whose anchor residues fall in different coarse
+groups never get compared, so they land in separate clusters.
+
+`--obg-block-search` addresses this. For each anchor it also searches
+**neighbouring blocks**, but only those whose *upper bound* on achievable
+similarity reaches the threshold — computed from the best possible residue match
+per block, so a block that cannot contain a match is provably skipped (a real
+match is never dropped). Eligible blocks are searched highest-bound-first.
+
+```bash
+pepcluster -i peptides.fasta -o out -t 0.5 --obg-block-search
+# cap the work (search at most 4 blocks per anchor):
+pepcluster -i peptides.fasta -o out -t 0.5 --obg-block-search --obg-max-probes 4
+```
+
+It yields **fewer, tighter clusters** (e.g. ~7% fewer at t=0.5 on random data) at
+extra cost; `--obg-max-probes` and `--obg-min-block-upper-bound` bound that cost.
+Off by default, so standard runs are unchanged.
 
 ---
 

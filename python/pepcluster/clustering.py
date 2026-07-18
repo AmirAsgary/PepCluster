@@ -73,11 +73,16 @@ for i, a in enumerate(AA_ORDER):
 # ============================================================================
 # Reduced alphabet for blocking (10 groups)
 # ============================================================================
+COARSE_GROUPS = ["AST", "VILM", "FYW", "DE", "KR", "NQ", "G", "H", "C", "P"]
 COARSE = {}
-for gid, aas in enumerate(["AST", "VILM", "FYW", "DE", "KR", "NQ",
-                            "G", "H", "C", "P"]):
+for gid, aas in enumerate(COARSE_GROUPS):
     for aa in aas:
         COARSE[aa] = gid
+
+# Max normalized similarity between any residues of two coarse groups (the
+# diagonal is 1.0). Used to upper-bound the similarity two blocks could reach.
+MAXGROUPSIM = [[max(SIM[(x, y)] for x in COARSE_GROUPS[g1] for y in COARSE_GROUPS[g2])
+                for g2 in range(10)] for g1 in range(10)]
 
 # Coarse-group lookup array indexed by ord(); 255 = unknown residue.
 # (255, not -1, so the packed block keys match the Rust backend byte-for-byte.)
@@ -105,7 +110,8 @@ class Tables:
     (anchor length, anchor positions, anchor weight) configuration."""
 
     __slots__ = ("alen", "anchor_positions", "anchor_weight", "weights",
-                 "wsim_by_pos", "wsim_ord", "check_pos", "remaining_after")
+                 "wsim_by_pos", "wsim_ord", "check_pos", "remaining_after",
+                 "anchor_wsum")
 
     def __init__(self, alen, anchor_positions, anchor_weight):
         self.alen = alen
@@ -118,6 +124,7 @@ class Tables:
             raw[p] = anchor_weight
         wsum = sum(raw)
         self.weights = [w / wsum for w in raw]
+        self.anchor_wsum = sum(self.weights[p] for p in anchor_positions)
 
         # Weighted 128x128 similarity table per position (weight baked in).
         self.wsim_by_pos = []
@@ -276,6 +283,30 @@ def _is_neighbour(k1, k2, n_ap):
     return False
 
 
+def _maxgroupsim_of(g1, g2):
+    """Max similarity between coarse groups. Same group (or any unknown residue,
+    coded 255) can reach the identity maximum of 1.0."""
+    if g1 == g2 or g1 >= 10 or g2 >= 10:
+        return 1.0
+    return MAXGROUPSIM[g1][g2]
+
+
+def block_upper_bound(k1, k2, tables):
+    """Upper bound on the anchor similarity achievable between any anchor in
+    block ``k1`` and any anchor in block ``k2``. Non-anchor positions are
+    unconstrained by the block key, so they contribute their full weight (max
+    similarity 1). Admissible: never below the true achievable maximum."""
+    ap = tables.anchor_positions
+    m = len(ap)
+    ub = 1.0 - tables.anchor_wsum  # all non-anchor positions at max
+    for i in range(m):
+        sh = 8 * (m - 1 - i)
+        g1 = (k1 >> sh) & 0xFF
+        g2 = (k2 >> sh) & 0xFF
+        ub += tables.weights[ap[i]] * _maxgroupsim_of(g1, g2)
+    return ub
+
+
 def parse_fasta(path):
     """Yield ``(header_id, full_sequence)`` from a FASTA file."""
     hdr = None
@@ -315,20 +346,31 @@ def _tables_for(anchor_counts, anchor_positions, anchor_weight):
 
 def cluster_anchors_py(anchor_counts, threshold,
                        anchor_positions=DEFAULT_ANCHOR_POSITIONS,
-                       anchor_weight=DEFAULT_ANCHOR_WEIGHT):
+                       anchor_weight=DEFAULT_ANCHOR_WEIGHT,
+                       obg_block_search=False, obg_max_probes=0,
+                       obg_min_block_upper_bound=0.0):
     """
     Greedy centroid clustering on unique anchors (pure-Python reference; the
     Rust backend ``pepcluster._core.cluster_anchors`` is a drop-in equivalent).
 
-    1. Block anchors by the coarse alphabet at the anchor positions
-    2. Within each block, process anchors most-frequent-first
-    3. Assign to the first centroid above threshold, or become a new centroid
+    Anchors are processed most-frequent-first; each joins the first centroid at
+    or above ``threshold``, else becomes a new centroid. Centroids are indexed
+    by block key.
+
+    With ``obg_block_search`` (Upper-Bound-Guided multi-probe search), an anchor
+    also considers centroids in neighbouring blocks whose upper bound reaches the
+    threshold — ranked by upper bound, own block first — so genuinely similar
+    anchors split across blocks by the coarse alphabet can still cluster.
 
     Args:
         anchor_counts:    dict[str, int] — unique anchor → peptide frequency
         threshold:        float          — minimum similarity to join a cluster
         anchor_positions: 0-based anchor positions (weighted up + blocked on)
         anchor_weight:    weight of anchor positions (others are 1.0)
+        obg_block_search: search neighbouring eligible blocks, not just own block
+        obg_max_probes:   max blocks searched per anchor incl. own (<=0 = all)
+        obg_min_block_upper_bound: only search blocks with upper bound at least
+                          this (effective cut is max(threshold, this))
 
     Returns:
         (mapping, n_comparisons, n_early_exits)
@@ -337,41 +379,67 @@ def cluster_anchors_py(anchor_counts, threshold,
     if not anchor_counts:
         return {}, 0, 0
     tables = _tables_for(anchor_counts, anchor_positions, anchor_weight)
+    cutoff = max(threshold, obg_min_block_upper_bound)
 
     # Sort by frequency descending (stable: ties keep insertion order).
     items = sorted(anchor_counts.items(), key=lambda x: -x[1])
-    str_to_ords = {}
-    blocks = defaultdict(list)
-    for anchor_str, _cnt in items:
-        ords = _to_ords(anchor_str)
-        str_to_ords[anchor_str] = ords
-        blocks[block_key_fast(ords, tables)].append(anchor_str)
+    str_to_ords = {a: _to_ords(a) for a, _ in items}
 
+    centroids_by_block = defaultdict(list)  # block key -> [centroid anchor str]
     mapping = {}
     n_cmp = 0
     n_early = 0
 
-    for _bk, anchors in blocks.items():
-        centroids_ords = []
-        centroids_str = []
-        for anchor_str in anchors:
-            a_ords = str_to_ords[anchor_str]
-            matched = False
-            for ci in range(len(centroids_ords)):
-                n_cmp += 1
-                score = anchor_sim_fast(a_ords, centroids_ords[ci], threshold,
-                                        tables)
-                if score < 0:
-                    n_early += 1
+    for anchor_str, _cnt in items:
+        a_ords = str_to_ords[anchor_str]
+        ki = block_key_fast(a_ords, tables)
+
+        # Neighbour blocks to probe, beyond the anchor's own block.
+        probe_blocks = []
+        if obg_block_search:
+            cand = []
+            for kb in centroids_by_block:
+                if kb == ki:
                     continue
-                if score >= threshold:
-                    mapping[anchor_str] = centroids_str[ci]
-                    matched = True
+                ub = block_upper_bound(ki, kb, tables)
+                if ub >= cutoff:
+                    cand.append((ub, kb))
+            cand.sort(key=lambda t: (-t[0], t[1]))  # highest bound first
+            if obg_max_probes > 0:
+                cand = cand[:max(obg_max_probes - 1, 0)]  # own block is 1 probe
+            probe_blocks = [kb for _ub, kb in cand]
+
+        # Search own block first, then the ranked neighbour blocks.
+        matched = None
+        for ci in centroids_by_block.get(ki, ()):
+            n_cmp += 1
+            score = anchor_sim_fast(a_ords, str_to_ords[ci], threshold, tables)
+            if score < 0:
+                n_early += 1
+                continue
+            if score >= threshold:
+                matched = ci
+                break
+        if matched is None:
+            for kb in probe_blocks:
+                for ci in centroids_by_block.get(kb, ()):
+                    n_cmp += 1
+                    score = anchor_sim_fast(a_ords, str_to_ords[ci], threshold,
+                                            tables)
+                    if score < 0:
+                        n_early += 1
+                        continue
+                    if score >= threshold:
+                        matched = ci
+                        break
+                if matched is not None:
                     break
-            if not matched:
-                centroids_ords.append(a_ords)
-                centroids_str.append(anchor_str)
-                mapping[anchor_str] = anchor_str
+
+        if matched is not None:
+            mapping[anchor_str] = matched
+        else:
+            centroids_by_block[ki].append(anchor_str)
+            mapping[anchor_str] = anchor_str
 
     return mapping, n_cmp, n_early
 
@@ -794,6 +862,8 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                   n_front=DEFAULT_N_FRONT, n_back=DEFAULT_N_BACK,
                   anchors=DEFAULT_ANCHOR_SPEC,
                   anchor_weight=DEFAULT_ANCHOR_WEIGHT,
+                  obg_block_search=False, obg_max_probes=0,
+                  obg_min_block_upper_bound=0.0,
                   refinement=False, iterations=3,
                   refine_cap=32, merge=True, fast_medoid=False, merge_cap=0,
                   backend="auto", verbose=True):
@@ -819,6 +889,14 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                           PΩ). See :func:`parse_anchors`.
         anchor_weight:    weight given to anchor positions (default 2.0; all
                           other positions are 1.0)
+        obg_block_search: Upper-Bound-Guided multi-probe block search — also
+                          compare each anchor against centroids in neighbouring
+                          blocks whose upper bound reaches the threshold, not
+                          just its own block (default False; fewer, tighter
+                          clusters at some extra cost)
+        obg_max_probes:   max blocks searched per anchor incl. own (<=0 = all)
+        obg_min_block_upper_bound: only search blocks with upper bound at least
+                          this (effective cut is max(threshold, this))
         refinement:       apply Lloyd-style refinement after greedy clustering
         iterations:       max refinement passes (only if refinement=True)
         refine_cap:       max centroid comparisons per anchor during refinement
@@ -890,10 +968,15 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
             f"(n_front={n_front}, n_back={n_back})")
 
     # ── Step 2: cluster unique anchors ────────────────────────────────
-    log(f"\n[2/4] Clustering unique anchors (threshold {threshold}, "
+    obg_note = ""
+    if obg_block_search:
+        lim = f", max_probes {obg_max_probes}" if obg_max_probes > 0 else ""
+        obg_note = f", OBG block search{lim}"
+    log(f"\n[2/4] Clustering unique anchors (threshold {threshold}{obg_note}, "
         f"backend: {backend_name}) …", flush=True)
-    mapping, n_cmp, n_early = cluster_fn(dict(acounts), threshold,
-                                         anchor_positions, anchor_weight)
+    mapping, n_cmp, n_early = cluster_fn(
+        dict(acounts), threshold, anchor_positions, anchor_weight,
+        obg_block_search, obg_max_probes, obg_min_block_upper_bound)
     n_clusters = len(set(mapping.values()))
     log(f"      {n_clusters:>12,}  clusters")
     log(f"      {n_cmp:>12,}  pairwise comparisons (within blocks)")
@@ -994,6 +1077,9 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         f"  Anchor weight:       {anchor_weight}x  (other positions 1x)",
         f"  Blocking:            coarse alphabet at positions {anchor_label} "
         f"({n_blocks:,} bins)",
+        f"  OBG block search:    {'enabled' if obg_block_search else 'disabled'}"
+        + (f"  (max_probes {obg_max_probes})"
+           if obg_block_search and obg_max_probes > 0 else ""),
         f"  Comparisons:         {n_cmp:,}",
         f"  Early-terminated:    {n_early:,}  ({early_pct:.1f}%)",
         "",
@@ -1060,6 +1146,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         "anchors":          anchors,
         "anchor_positions": list(anchor_positions),
         "anchor_weight":    anchor_weight,
+        "obg_block_search": obg_block_search,
         "comparisons":      n_cmp,
         "early_terminated": n_early,
         "refinement":       refine_stats,

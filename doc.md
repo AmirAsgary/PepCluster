@@ -52,6 +52,9 @@ print(stats["n_clusters"], "clusters")
 | `--n-back` | `3` | C-terminal anchor length |
 | `--anchors` | `"2;3"` | Which positions are binding anchors (see §5) |
 | `--anchor-weight` | `2.0` | Weight of anchor positions (all others `1.0`) |
+| `--obg-block-search` | off | Search neighbouring blocks (fewer, tighter clusters; see §8.5) |
+| `--obg-max-probes` | `0` | With OBG, max blocks searched per anchor (`0` = all) |
+| `--obg-min-block-upper-bound` | `0.0` | With OBG, raise the eligibility cut to `max(threshold, X)` |
 | `--refinement` | off | Lloyd-style refinement after greedy clustering (see §6) |
 | `--iterations` | `3` | Max refinement passes |
 | `--refine-cap` | `32` | Cap on reassignment comparisons per anchor (`<=0` = no cap) |
@@ -302,6 +305,27 @@ can never reach the threshold and the comparison is abandoned early (returns
 −1). This never discards a real match (it is *admissible*), and on strict
 thresholds it prunes the vast majority of comparisons after only one or two
 positions — e.g. at `t = 0.8` on 11M peptides, ~99.8% of comparisons early-exit.
+
+**Upper-bound-guided multi-probe search (`--obg-block-search`).** Blocking is a
+heuristic and can over-split (§8.4). With OBG on, an anchor also searches
+*neighbouring* blocks, restricted by an admissible **block-level upper bound**.
+For two blocks `K1, K2`, the best achievable similarity between any anchor in
+one and any anchor in the other is
+
+```
+UB(K1, K2) = Σ_{non-anchor p} w_p · 1  +  Σ_{anchor p} w_p · maxgroupsim(g1_p, g2_p)
+```
+
+where `maxgroupsim(g1, g2)` is the maximum normalized BLOSUM62 similarity between
+any residue of coarse group `g1` and any of `g2` (1.0 on the diagonal), and
+non-anchor positions are unconstrained by the block key so they contribute their
+full weight. Because `UB` is an upper bound, any block with `UB < threshold`
+provably contains no match and is skipped. Eligible blocks are ranked by `UB`
+(own block first, highest bound next) and searched greedily; `--obg-max-probes`
+caps how many are searched and `--obg-min-block-upper-bound` raises the
+eligibility cut to `max(threshold, X)`. The result is fewer, tighter clusters
+(the greedy recovers cross-block matches it would otherwise miss) at bounded
+extra cost. Off by default.
 
 ### 8.6 Cluster representatives (medoid)
 
