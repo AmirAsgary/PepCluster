@@ -74,6 +74,12 @@ def main(argv=None):
                          "refinement merge step (default: 0 = no cap). A value "
                          "like 32 makes merge fast when there are many clusters "
                          "(e.g. high thresholds). Only used with --refinement")
+    ap.add_argument("--threads", type=int, default=1,
+                    help="Worker threads for the Rust backend's greedy "
+                         "clustering and refinement (1 = serial, default; "
+                         "0 = all cores; N = exactly N). Results are identical "
+                         "regardless of thread count. The Python backend is "
+                         "always serial")
     ap.add_argument("--backend", choices=["auto", "rust", "python"],
                     default="auto",
                     help="Clustering backend (default: auto — Rust if built, "
@@ -103,6 +109,7 @@ def main(argv=None):
             merge=not args.no_merge,
             fast_medoid=args.fast_medoid,
             merge_cap=args.merge_cap,
+            threads=args.threads,
             backend=args.backend,
             verbose=not args.quiet,
         )

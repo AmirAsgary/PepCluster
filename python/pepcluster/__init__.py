@@ -34,7 +34,7 @@ from .clustering import (
     DEFAULT_ANCHOR_WEIGHT,
 )
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # Prefer the compiled Rust backend; fall back to the pure-Python reference.
 try:

@@ -1,6 +1,6 @@
 [package]
 name = "pepcluster"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Rust backend for BLOSUM62-aware anchor-residue clustering of immunopeptides"
 license = "MIT"
@@ -14,3 +14,4 @@ crate-type = ["cdylib"]
 # CPython 3.8+ (including future versions), instead of one wheel per version.
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+rayon = "1"

@@ -14,7 +14,20 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+
+/// Build a rayon thread pool with `threads` workers. `threads <= 0` uses all
+/// available cores (rayon's default). Parallelism never changes results: each
+/// unit of work writes to its own output slot and count reductions are integer
+/// sums, so the outcome is identical to the serial path bit-for-bit.
+fn build_pool(threads: i64) -> rayon::ThreadPool {
+    let n = if threads <= 0 { 0usize } else { threads as usize };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build()
+        .expect("failed to build thread pool")
+}
 
 // ============================================================================
 // BLOSUM62 matrix (20×20, standard order ARNDCQEGHILKMFPSTWYV)
@@ -351,6 +364,167 @@ fn medoid_fast(tables: &SimTables, flat: &[u8], freqs: &[u64],
     best_member
 }
 
+/// Greedy over one block's members (already in ascending index = frequency
+/// order). Returns per-member `(index, centroid_index)` plus comparison counts.
+/// Blocks are independent in same-block mode, so this is the unit of parallelism.
+fn greedy_block(tables: &SimTables, flat: &[u8], alen: usize, threshold: f64,
+                members: &[usize]) -> (Vec<(usize, usize)>, u64, u64) {
+    let mut centroids: Vec<usize> = Vec::new();
+    let mut assign: Vec<(usize, usize)> = Vec::with_capacity(members.len());
+    let mut n_cmp = 0u64;
+    let mut n_early = 0u64;
+    for &idx in members.iter() {
+        let mut matched: Option<usize> = None;
+        for &ci in centroids.iter() {
+            n_cmp += 1;
+            let s = tables.anchor_sim(arow(flat, idx, alen), arow(flat, ci, alen), threshold);
+            if s < 0.0 { n_early += 1; continue; }
+            if s >= threshold { matched = Some(ci); break; }
+        }
+        match matched {
+            Some(ci) => assign.push((idx, ci)),
+            None => { centroids.push(idx); assign.push((idx, idx)); }
+        }
+    }
+    (assign, n_cmp, n_early)
+}
+
+/// Greedy centroid clustering over all anchors (already sorted freq-desc into
+/// `flat`). Returns `(centroid_of, n_cmp, n_early)`.
+///
+/// With `threads == 1` (or OBG search, where blocks are not independent) this
+/// is the serial global pass. Otherwise blocks are clustered in parallel — the
+/// result is bit-identical because each block is independent and each anchor
+/// writes its own centroid slot.
+#[allow(clippy::too_many_arguments)]
+fn greedy_cluster(tables: &SimTables, flat: &[u8], alen: usize, n: usize,
+                  threshold: f64, obg_block_search: bool, obg_max_probes: i64,
+                  cutoff: f64, threads: i64) -> (Vec<usize>, u64, u64) {
+    let mut centroid_of: Vec<usize> = vec![0; n];
+
+    // Parallel path: same-block only (blocks independent) and threads != 1.
+    if !obg_block_search && threads != 1 {
+        let mut blocks: HashMap<u64, Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            blocks
+                .entry(tables.block_key(arow(flat, i, alen)))
+                .or_default()
+                .push(i); // pushed in 0..n order => ascending index (freq) order
+        }
+        let block_members: Vec<Vec<usize>> = blocks.into_values().collect();
+        let pool = build_pool(threads);
+        let results: Vec<(Vec<(usize, usize)>, u64, u64)> = pool.install(|| {
+            block_members
+                .par_iter()
+                .map(|members| greedy_block(tables, flat, alen, threshold, members))
+                .collect()
+        });
+        let mut n_cmp = 0u64;
+        let mut n_early = 0u64;
+        for (assign, nc, ne) in results {
+            for (idx, ci) in assign {
+                centroid_of[idx] = ci;
+            }
+            n_cmp += nc;
+            n_early += ne;
+        }
+        return (centroid_of, n_cmp, n_early);
+    }
+
+    // Serial path (also used for OBG). Anchors processed most-frequent-first;
+    // each joins the first centroid at or above `threshold`, else becomes a new
+    // centroid. With OBG on, neighbouring blocks are probed, ranked by bound.
+    let mut centroids_by_block: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut n_cmp: u64 = 0;
+    let mut n_early: u64 = 0;
+
+    for i in 0..n {
+        let ki = tables.block_key(arow(flat, i, alen));
+
+        let mut probe_blocks: Vec<u64> = Vec::new();
+        if obg_block_search {
+            let mut cand: Vec<(f64, u64)> = Vec::new();
+            for &kb in centroids_by_block.keys() {
+                if kb == ki { continue; }
+                let ub = tables.block_upper_bound(ki, kb);
+                if ub >= cutoff {
+                    cand.push((ub, kb));
+                }
+            }
+            cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+            if obg_max_probes > 0 {
+                let keep = (obg_max_probes - 1).max(0) as usize;
+                cand.truncate(keep);
+            }
+            probe_blocks.extend(cand.into_iter().map(|(_, kb)| kb));
+        }
+
+        let mut matched: Option<usize> = None;
+        if let Some(cs) = centroids_by_block.get(&ki) {
+            for &ci in cs.iter() {
+                n_cmp += 1;
+                let s = tables.anchor_sim(arow(flat, i, alen), arow(flat, ci, alen), threshold);
+                if s < 0.0 { n_early += 1; continue; }
+                if s >= threshold { matched = Some(ci); break; }
+            }
+        }
+        if matched.is_none() {
+            'nb: for &kb in probe_blocks.iter() {
+                if let Some(cs) = centroids_by_block.get(&kb) {
+                    for &ci in cs.iter() {
+                        n_cmp += 1;
+                        let s = tables.anchor_sim(arow(flat, i, alen), arow(flat, ci, alen), threshold);
+                        if s < 0.0 { n_early += 1; continue; }
+                        if s >= threshold { matched = Some(ci); break 'nb; }
+                    }
+                }
+            }
+        }
+
+        match matched {
+            Some(ci) => centroid_of[i] = ci,
+            None => {
+                centroids_by_block.entry(ki).or_default().push(i);
+                centroid_of[i] = i;
+            }
+        }
+    }
+
+    (centroid_of, n_cmp, n_early)
+}
+
+/// Best centroid for anchor `i` in the reassignment step (own block first, then
+/// neighbours, largest-cluster-first, bounded by `cap`). Reads only the fixed
+/// pre-pass snapshot, so anchors are independent and this parallelises exactly.
+#[allow(clippy::too_many_arguments)]
+fn reassign_one(tables: &SimTables, flat: &[u8], alen: usize, i: usize,
+                cur_centroid: &[usize],
+                centroids_in_block: &HashMap<u64, Vec<usize>>,
+                neighbours_of: &HashMap<u64, Vec<u64>>,
+                threshold: f64, cap: i64) -> usize {
+    let bk = tables.block_key(arow(flat, i, alen));
+    let cur_c = cur_centroid[i];
+    let cur_score = tables.anchor_sim_full(arow(flat, i, alen), arow(flat, cur_c, alen));
+    let mut best_c = cur_c;
+    let mut best_score = cur_score;
+    let empty: Vec<u64> = Vec::new();
+    let nbs = neighbours_of.get(&bk).unwrap_or(&empty);
+    let mut examined: i64 = 0;
+    'scan: for &nb in nbs.iter() {
+        if let Some(centroids) = centroids_in_block.get(&nb) {
+            for &c in centroids.iter() {
+                if c == cur_c { continue; }
+                if cap > 0 && examined >= cap { break 'scan; }
+                let sc = tables.anchor_sim(arow(flat, i, alen), arow(flat, c, alen), threshold);
+                examined += 1;
+                if sc < 0.0 { continue; }
+                if sc > best_score { best_score = sc; best_c = c; }
+            }
+        }
+    }
+    if best_c != cur_c && best_score >= threshold { best_c } else { cur_c }
+}
+
 /// Validate + canonicalise (sort, dedup) the anchor positions.
 fn check_positions(ap: &[usize], alen: usize) -> PyResult<Vec<usize>> {
     let mut v = ap.to_vec();
@@ -427,12 +601,16 @@ fn parse_anchor_counts(
 ///     obg_min_block_upper_bound: float — only search blocks whose upper bound
 ///                       is at least this (the effective cut is
 ///                       max(threshold, this))
+///     threads:          int — worker threads for the greedy pass. 1 = serial
+///                       (default), 0 = all cores, N = exactly N. Bit-identical
+///                       to serial. Ignored when obg_block_search is on.
 ///
 /// Returns:
 ///     (mapping, n_comparisons, n_early_exits)
 #[pyfunction]
 #[pyo3(signature = (anchor_counts, threshold, anchor_positions=vec![1, 5], anchor_weight=2.0,
-                    obg_block_search=false, obg_max_probes=0, obg_min_block_upper_bound=0.0))]
+                    obg_block_search=false, obg_max_probes=0, obg_min_block_upper_bound=0.0,
+                    threads=1))]
 fn cluster_anchors(
     py: Python<'_>,
     anchor_counts: &Bound<'_, PyDict>,
@@ -442,6 +620,7 @@ fn cluster_anchors(
     obg_block_search: bool,
     obg_max_probes: i64,
     obg_min_block_upper_bound: f64,
+    threads: i64,
 ) -> PyResult<(PyObject, u64, u64)> {
     let (names_in, flat_in, counts_in, alen) = parse_anchor_counts(anchor_counts)?;
     if names_in.is_empty() {
@@ -464,75 +643,12 @@ fn cluster_anchors(
         flat.extend_from_slice(arow(&flat_in, oi, alen));
     }
 
-    // Greedy centroid clustering. Anchors are processed most-frequent-first;
-    // each joins the first centroid at or above `threshold`, else becomes a new
-    // centroid. Centroids are indexed by block key. When OBG search is on, an
-    // anchor also considers centroids in neighbouring blocks whose upper bound
-    // reaches the threshold, ranked by upper bound (own block always first).
-    let mut centroids_by_block: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut centroid_of: Vec<usize> = vec![0; n];
-    let mut n_cmp: u64 = 0;
-    let mut n_early: u64 = 0;
-
-    for i in 0..n {
-        let ki = tables.block_key(arow(&flat, i, alen));
-
-        // Neighbour blocks to probe, beyond the anchor's own block.
-        let mut probe_blocks: Vec<u64> = Vec::new();
-        if obg_block_search {
-            let mut cand: Vec<(f64, u64)> = Vec::new();
-            for &kb in centroids_by_block.keys() {
-                if kb == ki { continue; }
-                let ub = tables.block_upper_bound(ki, kb);
-                if ub >= cutoff {
-                    cand.push((ub, kb));
-                }
-            }
-            // Highest upper bound first; ties by block key for determinism.
-            cand.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1))
-            });
-            if obg_max_probes > 0 {
-                // Own block counts as one probe.
-                let keep = (obg_max_probes - 1).max(0) as usize;
-                cand.truncate(keep);
-            }
-            probe_blocks.extend(cand.into_iter().map(|(_, kb)| kb));
-        }
-
-        // Search own block first, then the ranked neighbour blocks.
-        let mut matched: Option<usize> = None;
-        if let Some(cs) = centroids_by_block.get(&ki) {
-            for &ci in cs.iter() {
-                n_cmp += 1;
-                let s = tables.anchor_sim(
-                    arow(&flat, i, alen), arow(&flat, ci, alen), threshold);
-                if s < 0.0 { n_early += 1; continue; }
-                if s >= threshold { matched = Some(ci); break; }
-            }
-        }
-        if matched.is_none() {
-            'nb: for &kb in probe_blocks.iter() {
-                if let Some(cs) = centroids_by_block.get(&kb) {
-                    for &ci in cs.iter() {
-                        n_cmp += 1;
-                        let s = tables.anchor_sim(
-                            arow(&flat, i, alen), arow(&flat, ci, alen), threshold);
-                        if s < 0.0 { n_early += 1; continue; }
-                        if s >= threshold { matched = Some(ci); break 'nb; }
-                    }
-                }
-            }
-        }
-
-        match matched {
-            Some(ci) => centroid_of[i] = ci,
-            None => {
-                centroids_by_block.entry(ki).or_default().push(i);
-                centroid_of[i] = i;
-            }
-        }
-    }
+    // The greedy touches only native data — release the GIL around it so the
+    // worker threads (and any other Python threads) can run freely.
+    let (centroid_of, n_cmp, n_early) = py.allow_threads(|| {
+        greedy_cluster(&tables, &flat, alen, n, threshold,
+                       obg_block_search, obg_max_probes, cutoff, threads)
+    });
 
     // Build result dict: anchor_str → centroid_str
     let result = PyDict::new(py);
@@ -587,13 +703,17 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///     merge_cap:        int             — max candidate centroids examined per
 ///                                         centroid in the merge step (own-block
 ///                                         first, largest first). <= 0 = no cap.
+///     threads:          int             — worker threads for the medoid and
+///                                         reassignment steps. 1 = serial
+///                                         (default), 0 = all cores, N = exactly
+///                                         N. Bit-identical to serial.
 ///
 /// Returns:
 ///     (refined_mapping, stats_dict)
 #[pyfunction]
 #[pyo3(signature = (anchor_counts, mapping, threshold, iterations, cap=32, merge=true,
                     anchor_positions=vec![1, 5], anchor_weight=2.0,
-                    fast_medoid=false, merge_cap=0))]
+                    fast_medoid=false, merge_cap=0, threads=1))]
 fn refine_clusters(
     py: Python<'_>,
     anchor_counts: &Bound<'_, PyDict>,
@@ -606,6 +726,7 @@ fn refine_clusters(
     anchor_weight: f64,
     fast_medoid: bool,
     merge_cap: i64,
+    threads: i64,
 ) -> PyResult<(PyObject, PyObject)> {
     let (names, flat, freqs, alen) = parse_anchor_counts(anchor_counts)?;
     let n = names.len();
@@ -619,6 +740,8 @@ fn refine_clusters(
     }
     let ap = check_positions(&anchor_positions, alen)?;
     let tables = SimTables::new(alen, &ap, anchor_weight);
+    // Thread pool for the medoid + reassignment steps (None => serial).
+    let pool = if threads != 1 { Some(build_pool(threads)) } else { None };
 
     let mut str_to_idx: HashMap<&str, usize> = HashMap::with_capacity(n);
     for (i, nm) in names.iter().enumerate() {
@@ -665,18 +788,28 @@ fn refine_clusters(
             v.sort_by(|&a, &b| names[a].cmp(&names[b]));
         }
 
-        let mut centroid_remap: HashMap<usize, usize> = HashMap::with_capacity(members.len());
-        for (&centroid, mems) in members.iter() {
+        // Each cluster's medoid is independent → compute in parallel, then
+        // fold into the remap serially (order-independent, so bit-identical).
+        let member_list: Vec<(usize, &Vec<usize>)> =
+            members.iter().map(|(&c, v)| (c, v)).collect();
+        let medoid_of = |&(centroid, mems): &(usize, &Vec<usize>)| -> (usize, usize) {
             if mems.len() == 1 {
-                centroid_remap.insert(centroid, centroid);
-                continue;
-            }
-            let best_member = if fast_medoid {
-                medoid_fast(&tables, &flat, &freqs, mems, centroid)
+                (centroid, centroid)
+            } else if fast_medoid {
+                (centroid, medoid_fast(&tables, &flat, &freqs, mems, centroid))
             } else {
-                medoid_exact(&tables, &flat, &freqs, mems, centroid)
-            };
-            centroid_remap.insert(centroid, best_member);
+                (centroid, medoid_exact(&tables, &flat, &freqs, mems, centroid))
+            }
+        };
+        let remap_pairs: Vec<(usize, usize)> = match &pool {
+            Some(p) => p.install(|| member_list.par_iter().map(medoid_of).collect()),
+            None => member_list.iter().map(medoid_of).collect(),
+        };
+
+        let mut centroid_remap: HashMap<usize, usize> =
+            HashMap::with_capacity(remap_pairs.len());
+        for (centroid, best_member) in &remap_pairs {
+            centroid_remap.insert(*centroid, *best_member);
             if best_member != centroid {
                 total_medoid_changes += 1;
                 changed = true;
@@ -727,39 +860,25 @@ fn refine_clusters(
             neighbours_of.insert(bk, nb);
         }
 
-        let fallback_nb = vec![]; // empty fallback if anchor's block has no centroids
+        // Each anchor's best centroid depends only on the fixed pre-pass
+        // snapshot (cur_centroid + centroids_in_block), so compute in parallel
+        // then apply serially → bit-identical to the serial pass.
+        let one = |i: usize| reassign_one(&tables, &flat, alen, i, &cur_centroid,
+                                          &centroids_in_block, &neighbours_of,
+                                          threshold, cap);
+        let new_c: Vec<usize> = match &pool {
+            Some(p) => p.install(|| (0..n).into_par_iter().map(one).collect()),
+            None => (0..n).map(one).collect(),
+        };
         let mut pass_reassigns: u64 = 0;
         for i in 0..n {
-            let bk    = tables.block_key(arow(&flat, i, alen));
-            let cur_c = cur_centroid[i];
-            let cur_score = tables.anchor_sim_full(
-                arow(&flat, i, alen), arow(&flat, cur_c, alen));
-            let mut best_c     = cur_c;
-            let mut best_score = cur_score;
-
-            let nbs = neighbours_of.get(&bk).unwrap_or(&fallback_nb);
-            let mut examined: i64 = 0;
-            'scan: for &nb in nbs.iter() {
-                if let Some(centroids) = centroids_in_block.get(&nb) {
-                    for &c in centroids.iter() {
-                        if c == cur_c { continue; }
-                        if cap > 0 && examined >= cap { break 'scan; }
-                        let sc = tables.anchor_sim(
-                            arow(&flat, i, alen), arow(&flat, c, alen), threshold);
-                        examined += 1;
-                        if sc < 0.0 { continue; }
-                        if sc > best_score {
-                            best_score = sc;
-                            best_c     = c;
-                        }
-                    }
-                }
-            }
-            if best_c != cur_c && best_score >= threshold {
-                cur_centroid[i] = best_c;
+            if new_c[i] != cur_centroid[i] {
+                cur_centroid[i] = new_c[i];
                 pass_reassigns += 1;
-                changed = true;
             }
+        }
+        if pass_reassigns > 0 {
+            changed = true;
         }
         total_reassignments += pass_reassigns;
 

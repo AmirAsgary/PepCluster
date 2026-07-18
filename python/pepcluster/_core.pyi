@@ -10,6 +10,7 @@ def cluster_anchors(
     obg_block_search: bool = False,
     obg_max_probes: int = 0,
     obg_min_block_upper_bound: float = 0.0,
+    threads: int = 1,
 ) -> Tuple[Dict[str, str], int, int]:
     """Greedy centroid clustering of unique anchors.
 
@@ -40,6 +41,7 @@ def refine_clusters(
     anchor_weight: float = 2.0,
     fast_medoid: bool = False,
     merge_cap: int = 0,
+    threads: int = 1,
 ) -> Tuple[Dict[str, str], Dict[str, int]]:
     """Lloyd-style refinement of an existing clustering.
 

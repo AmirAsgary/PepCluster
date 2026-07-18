@@ -188,6 +188,55 @@ def test_rust_python_obg_parity_custom_anchors(alen, ap):
     assert rs_map == py_map
 
 
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("threads", [2, 4, 0])
+@pytest.mark.parametrize("thr", [0.3, 0.6, 0.8])
+def test_greedy_multithreaded_matches_serial(thr, threads):
+    """Threaded greedy must be bit-identical to serial (mapping + counts)."""
+    counts = _random_counts(5000, seed=3)
+    s_map, s_c, s_e = pepcluster.cluster_anchors(counts, thr, DEFAULT_AP, 2.0,
+                                                 False, 0, 0.0, 1)
+    m_map, m_c, m_e = pepcluster.cluster_anchors(counts, thr, DEFAULT_AP, 2.0,
+                                                 False, 0, 0.0, threads)
+    assert m_map == s_map
+    assert (m_c, m_e) == (s_c, s_e)
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+@pytest.mark.parametrize("threads", [2, 4])
+@pytest.mark.parametrize("fast_medoid", [False, True])
+def test_refine_multithreaded_matches_serial(threads, fast_medoid):
+    """Threaded medoid + reassignment must be bit-identical to serial."""
+    counts = _random_counts(4000, seed=8)
+    base, _, _ = cluster_anchors_py(counts, 0.5)
+    s_map, s_s = pepcluster.refine_clusters(counts, base, 0.5, 3, 32, True,
+                                            DEFAULT_AP, 2.0, fast_medoid, 16, 1)
+    m_map, m_s = pepcluster.refine_clusters(counts, base, 0.5, 3, 32, True,
+                                            DEFAULT_AP, 2.0, fast_medoid, 16, threads)
+    assert m_map == s_map
+    assert dict(m_s) == dict(s_s)
+
+
+@pytest.mark.skipif(not pepcluster.HAS_RUST, reason="Rust backend not built")
+def test_threads_match_python_backend():
+    """Threaded Rust must still equal the (serial) Python backend."""
+    counts = _random_counts(3000, seed=2)
+    py_map, _, _ = cluster_anchors_py(counts, 0.5)
+    rs_map, _, _ = pepcluster.cluster_anchors(counts, 0.5, DEFAULT_AP, 2.0,
+                                              False, 0, 0.0, 4)
+    assert rs_map == py_map
+
+
+def test_cluster_fasta_threads(tmp_path):
+    a = pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path / "s"), threshold=0.6,
+                                 refinement=True, threads=1, verbose=False)
+    b = pepcluster.cluster_fasta(str(EXAMPLE), str(tmp_path / "m"), threshold=0.6,
+                                 refinement=True, threads=4, verbose=False)
+    assert a["n_clusters"] == b["n_clusters"]
+    assert (tmp_path / "s" / "clusters.tsv").read_text() == \
+        (tmp_path / "m" / "clusters.tsv").read_text()
+
+
 def test_obg_merges_a_split_pair():
     """Two anchors similar overall but split across blocks by the coarse
     alphabet: OBG puts them together, plain greedy does not."""

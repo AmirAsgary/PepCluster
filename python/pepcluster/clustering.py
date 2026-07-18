@@ -348,7 +348,7 @@ def cluster_anchors_py(anchor_counts, threshold,
                        anchor_positions=DEFAULT_ANCHOR_POSITIONS,
                        anchor_weight=DEFAULT_ANCHOR_WEIGHT,
                        obg_block_search=False, obg_max_probes=0,
-                       obg_min_block_upper_bound=0.0):
+                       obg_min_block_upper_bound=0.0, threads=1):
     """
     Greedy centroid clustering on unique anchors (pure-Python reference; the
     Rust backend ``pepcluster._core.cluster_anchors`` is a drop-in equivalent).
@@ -371,6 +371,8 @@ def cluster_anchors_py(anchor_counts, threshold,
         obg_max_probes:   max blocks searched per anchor incl. own (<=0 = all)
         obg_min_block_upper_bound: only search blocks with upper bound at least
                           this (effective cut is max(threshold, this))
+        threads:          accepted for signature compatibility with the Rust
+                          backend; the pure-Python backend is always serial
 
     Returns:
         (mapping, n_comparisons, n_early_exits)
@@ -520,7 +522,7 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
                        cap=32, merge=True,
                        anchor_positions=DEFAULT_ANCHOR_POSITIONS,
                        anchor_weight=DEFAULT_ANCHOR_WEIGHT,
-                       fast_medoid=False, merge_cap=0, verbose=False):
+                       fast_medoid=False, merge_cap=0, threads=1, verbose=False):
     """
     Lloyd-style refinement on top of greedy clustering output (pure-Python
     reference; the Rust backend ``pepcluster._core.refine_clusters`` is a
@@ -560,6 +562,9 @@ def refine_clusters_py(anchor_counts, mapping, threshold, iterations=3,
         merge_cap:        int             max candidate centroids examined per
                                           centroid in the merge step (own-block
                                           first, largest first). <= 0 = no cap.
+        threads:          int             accepted for signature compatibility
+                                          with the Rust backend; the pure-Python
+                                          backend is always serial
         verbose:          bool            print per-pass stats
 
     Returns:
@@ -866,7 +871,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                   obg_min_block_upper_bound=0.0,
                   refinement=False, iterations=3,
                   refine_cap=32, merge=True, fast_medoid=False, merge_cap=0,
-                  backend="auto", verbose=True):
+                  threads=1, backend="auto", verbose=True):
     """
     Run the full anchor-clustering pipeline on a FASTA file.
 
@@ -909,6 +914,10 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
                           merge step (default 0 = no cap; a positive value such
                           as 32 makes merge fast when there are many clusters,
                           e.g. high thresholds)
+        threads:          worker threads for the Rust backend's greedy clustering
+                          and refinement reassignment/medoid steps (default 1 =
+                          serial; 0 = all cores; N = exactly N). Bit-identical to
+                          serial. The Python backend ignores it (always serial)
         backend:          "auto" | "rust" | "python"
         verbose:          print progress to stdout
 
@@ -976,7 +985,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
         f"backend: {backend_name}) …", flush=True)
     mapping, n_cmp, n_early = cluster_fn(
         dict(acounts), threshold, anchor_positions, anchor_weight,
-        obg_block_search, obg_max_probes, obg_min_block_upper_bound)
+        obg_block_search, obg_max_probes, obg_min_block_upper_bound, threads)
     n_clusters = len(set(mapping.values()))
     log(f"      {n_clusters:>12,}  clusters")
     log(f"      {n_cmp:>12,}  pairwise comparisons (within blocks)")
@@ -993,7 +1002,7 @@ def cluster_fasta(input, outdir, threshold=0.6, min_cluster_size=2,
             f"backend: {backend_name}) …", flush=True)
         mapping, refine_stats = refine_fn(
             dict(acounts), mapping, threshold, iterations, refine_cap, merge,
-            anchor_positions, anchor_weight, fast_medoid, merge_cap)
+            anchor_positions, anchor_weight, fast_medoid, merge_cap, threads)
         log(f"      passes run:      {refine_stats['passes']}")
         log(f"      medoid changes:  {refine_stats['medoid_changes']:,}")
         log(f"      reassignments:   {refine_stats['reassignments']:,}")
