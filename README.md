@@ -86,6 +86,14 @@ fall back to identical pure-Python implementations otherwise).
 | `--no-merge` | off | Skip the refinement centroid-merge step (much faster on many-cluster data) |
 | `--fast-medoid` | off | O(N) medoid instead of exact O(k²) (much faster when a few clusters are huge) |
 | `--merge-cap` | `0` | Cap candidate centroids per cluster in the merge step (`0` = no cap; e.g. `32` on many-cluster data) |
+| `--central-region-profiling` | off | Merge clusters by a combined anchor + central-region-k-mer score (see [Central-region profiling](#central-region-profiling)) |
+| `--crr-kmer-size` | `2` | Central-region k-mer length |
+| `--crr-bins` | `3` | Number of relative-position bins for central k-mers |
+| `--crr-adjacent-bin-smoothing` | `0.5` | Adjacent-bin smoothing weight α |
+| `--no-cluster-profile-merge` | off | With profiling on, keep the anchor-only merge |
+| `--cluster-profile-merge-weight` | `0.2` | Weight of the central-profile term in the merge score |
+| `--cluster-profile-merge-threshold` | `0.6` | Combined-score threshold to merge |
+| `--threads` | `1` | Worker threads for the Rust backend (`1` = serial, `0` = all cores, `N` = exactly N). Results identical regardless |
 | `--backend` | `auto` | `auto` \| `rust` \| `python` |
 | `-q, --quiet` | — | Suppress progress output |
 
@@ -117,6 +125,23 @@ pepcluster -i peptides.fasta -o out -t 0.6 --refinement \
 
 Defaults are unchanged (exact medoid, uncapped merge) for backward
 compatibility — the fast paths are opt-in.
+
+### Multithreading
+
+**`--threads N`** runs the greedy clustering and the refinement medoid /
+reassignment steps in parallel (Rust backend). `1` = serial (default), `0` =
+all cores, `N` = exactly N. Results are **bit-identical regardless of thread
+count** — each unit writes its own slot and counts are integer sums.
+
+```bash
+pepcluster -i peptides.fasta -o out -t 0.8 --refinement --threads 0
+```
+
+On 24 cores the greedy is ~4–9× faster (most at strict thresholds, where it does
+the most work); the merge step stays serial, and the OBG greedy stays serial
+(blocks aren't independent there). The Python backend is always serial. Since
+the tool is otherwise single-threaded, `-c 2` on SLURM was enough before —
+raise it to match `--threads`.
 
 **Threshold guide:**
 
@@ -187,6 +212,36 @@ pepcluster -i peptides.fasta -o out -t 0.5 --obg-block-search --obg-max-probes 4
 It yields **fewer, tighter clusters** (e.g. ~7% fewer at t=0.5 on random data) at
 extra cost; `--obg-max-probes` and `--obg-min-block-upper-bound` bound that cost.
 Off by default, so standard runs are unchanged.
+
+---
+
+## Central-region profiling
+
+Anchor clustering ignores the peptide's middle. Two clusters can have similar
+anchors but very different central regions (or vice-versa). With
+`--central-region-profiling` (requires `--refinement`), each cluster gets a
+**central-region k-mer profile**, and the refinement merge step uses a combined
+score instead of anchor similarity alone:
+
+```
+S_merge = (1 − w)·S_anchor(centroid₁, centroid₂) + w·S_kmer(profile₁, profile₂)
+```
+
+so clusters merge only when their anchors **and** their middle regions agree.
+`S_kmer` is a weighted Jaccard over position-binned k-mer profiles, smoothed
+across adjacent bins. Everything is deterministic (integer bin assignment, raw
+integer counts, sorted-feature sums).
+
+```bash
+pepcluster -i peptides.fasta -o out -t 0.8 --refinement \
+    --central-region-profiling --cluster-profile-merge-weight 0.2
+```
+
+Knobs: `--crr-kmer-size` (2), `--crr-bins` (3), `--crr-adjacent-bin-smoothing`
+(0.5), `--cluster-profile-merge-weight` (0.2), `--cluster-profile-merge-threshold`
+(0.6); `--no-cluster-profile-merge` keeps the anchor-only merge. Off by default.
+This step runs in Python and scales with the number of clusters, so on very
+large, many-cluster data pair it with `--merge-cap`.
 
 ---
 

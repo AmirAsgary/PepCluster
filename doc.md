@@ -61,6 +61,14 @@ print(stats["n_clusters"], "clusters")
 | `--no-merge` | off | Skip the refinement merge step |
 | `--fast-medoid` | off | O(N) medoid instead of exact O(k²) |
 | `--merge-cap` | `0` | Cap on merge comparisons per cluster (`0` = no cap) |
+| `--central-region-profiling` | off | Merge by combined anchor + central-k-mer score (see §8.11) |
+| `--crr-kmer-size` | `2` | Central-region k-mer length |
+| `--crr-bins` | `3` | Number of relative-position bins |
+| `--crr-adjacent-bin-smoothing` | `0.5` | Adjacent-bin smoothing weight α |
+| `--no-cluster-profile-merge` | off | With profiling, keep the anchor-only merge |
+| `--cluster-profile-merge-weight` | `0.2` | Weight of the central-profile term |
+| `--cluster-profile-merge-threshold` | `0.6` | Combined-score threshold to merge |
+| `--threads` | `1` | Rust worker threads (`1` serial, `0` all cores, `N` exact); results identical |
 | `--backend` | `auto` | `auto` \| `rust` \| `python` |
 | `-q, --quiet` | — | Suppress progress output |
 
@@ -456,10 +464,71 @@ Memory is O(U · L) for the anchors plus O(U) bookkeeping.
 - **`--refinement`** improves cluster assignments at extra cost; on large data
   pair it with the fast flags from §8.7 so every sub-step is bounded.
 
+### 8.11 Central-region k-mer profiling (`--central-region-profiling`)
+
+Anchor clustering discards the peptide's middle. This optional step (requires
+`--refinement`) profiles each cluster's central region and folds it into the
+merge decision.
+
+**Middle & k-mers.** The middle is `seq[n_front : len − n_back]`. Overlapping
+k-mers (default `k = 2`) are taken over it; `n = len(middle) − k + 1`.
+
+**Deterministic integer binning.** Each k-mer `i` (0-based) is placed in one of
+`B` relative-position bins by *integer* arithmetic (so identical everywhere):
+
+```
+bin(i) = ( 2·i·(B−1) + (n−1) ) // ( 2·(n−1) )   for n > 1
+bin    = (B − 1) // 2                            for n = 1   (central bin)
+```
+
+Peptides with `n < 1` (middle shorter than `k`) contribute nothing.
+
+**Per-cluster profiles.** Each cluster stores a **raw integer** profile
+`c_C(b, k)` = count of feature `(bin, k-mer)` over its peptides. Because merges
+combine profiles by integer addition, a merged profile equals a rebuild from all
+members exactly, independent of merge order.
+
+**Similarity.** To compare two clusters, profiles are turned into weights on the
+fly: normalize `f = c / N`, apply adjacent-bin smoothing
+`f̃(b,k) = f(b,k) + α·f(b−1,k) + α·f(b+1,k)` (α default 0.5, zero outside range),
+renormalize, then take a **weighted Jaccard**
+`Σ min(f̃₁,f̃₂) / Σ max(f̃₁,f̃₂)` over the union of features (summed in sorted
+order → reproducible).
+
+**Profile-aware merge (`#3`).** When profiling is on, the anchor-only merge is
+replaced by an agglomerative pass over the refined clusters using
+
+```
+S_merge = (1 − w)·S_anchor(centroid₁, centroid₂) + w·S_kmer(profile₁, profile₂)
+```
+
+(`w` default 0.2), merging a *smaller* neighbouring cluster into a larger one
+when `S_merge ≥ t_merge` (default 0.6). It reuses the coarse-block neighbour
+structure and `--merge-cap`. `--no-cluster-profile-merge` keeps the anchor-only
+merge. This step runs in Python (post-refinement) and costs roughly
+O(clusters × candidates × features); off by default.
+
+### 8.12 Multithreading (`--threads`)
+
+The Rust backend parallelizes the two dominant per-element loops with a rayon
+thread pool: the **greedy pass across independent blocks**, and the refinement
+**medoid update (per cluster)** and **reassignment (per anchor)**. The merge
+step stays serial (its `absorbed` set is stateful), and the OBG greedy stays
+serial (blocks are not independent there).
+
+Parallelism **does not change results**: every unit writes its own output slot
+from a fixed pre-pass snapshot, and the only cross-unit reductions are integer
+count sums — so the output is bit-identical to serial for any thread count (and
+still equals the serial Python backend). `--threads 1` (default) is the exact
+serial path; `0` uses all cores; `N` uses N. The GIL is released around the
+parallel work. Measured on 24 cores: greedy ≈ 4–9× (most at strict thresholds).
+
 ---
 
 ## 9. Notes
 
-- **Single-threaded** — extra cores don't speed it up (allocate `-c 2` on SLURM).
-- **Memory** scales linearly with the number of unique anchors.
+- **Multithreading** — `--threads` parallelizes the Rust backend deterministically
+  (see §8.12); allocate SLURM cores to match. The Python backend is serial.
+- **Memory** scales linearly with the number of unique anchors (plus the
+  central-region profiles when `--central-region-profiling` is on).
 - **License:** MIT.
